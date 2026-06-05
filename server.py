@@ -550,8 +550,8 @@ async def _stop_scheduler() -> None:
     _scheduler.shutdown(wait=False)
 
 
-app.router.on_startup.append(_start_scheduler)
-app.router.on_shutdown.append(_stop_scheduler)
+app.add_event_handler("startup", _start_scheduler)
+app.add_event_handler("shutdown", _stop_scheduler)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
