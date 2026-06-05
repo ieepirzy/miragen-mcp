@@ -519,6 +519,7 @@ def validate_yaml(source: str) -> str:
 auth = OAuthProvider(
     base_url=BASE_URL,
     clients={CLIENT_ID: CLIENT_SECRET},
+    token_ttl=604800,
 )
 
 app = mcp.http_app(stateless_http=True)
