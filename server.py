@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -542,16 +543,18 @@ app.state.public_registration = auth.public_registration
 app.state.auto_approve = auth.auto_approve
 
 
-async def _start_scheduler() -> None:
-    _scheduler.start()
+_original_lifespan = app.router.lifespan_context
 
 
-async def _stop_scheduler() -> None:
-    _scheduler.shutdown(wait=False)
+@asynccontextmanager
+async def _lifespan(scope):
+    async with _original_lifespan(scope):
+        _scheduler.start()
+        yield
+        _scheduler.shutdown(wait=False)
 
 
-app.add_event_handler("startup", _start_scheduler)
-app.add_event_handler("shutdown", _stop_scheduler)
+app.router.lifespan_context = _lifespan
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
