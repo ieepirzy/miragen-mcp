@@ -1,0 +1,25 @@
+
+
+services:
+  miragen-mcp:
+    build: .
+    container_name: miragen-mcp
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/miragen:/opt/miragen
+    environment:
+      MIRAGEN_WORKSPACE: /opt/miragen
+      MCP_BASE_URL: ${MCP_BASE_URL}
+      MCP_CLIENT_ID: ${MCP_CLIENT_ID}
+      MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
+    ports:
+      - "127.0.0.1:8080:8000"
+    networks:
+      - proxy
+    security_opt:
+    - no-new-privileges:true
+
+networks:
+  proxy:
+    external: true
