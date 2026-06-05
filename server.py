@@ -495,16 +495,31 @@ def set_retrigger(agent: str, delay_seconds: int | None = None, at: str | None =
 
 
 @mcp.tool()
+def get_miragen_readme() -> str:
+    """Fetch the latest miragen README from GitHub."""
+    try:
+        resp = httpx.get(
+            "https://raw.githubusercontent.com/ieepirzy/miragen/main/README.md",
+            timeout=10,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        return resp.text
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@mcp.tool()
 def validate_yaml(source: str) -> str:
     """Validate a miragen agent YAML profile using the miragen CLI."""
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", dir=WORKSPACE, delete=False
+        mode="w", suffix=".yaml", delete=False
     ) as f:
         f.write(source)
         tmp = Path(f.name)
     try:
         result = subprocess.run(
-            ["miragen", "validate", str(tmp.relative_to(WORKSPACE))],
+            ["miragen", "validate", str(tmp)],
             capture_output=True, text=True, cwd=WORKSPACE,
         )
         return (result.stdout + result.stderr).strip() or "OK"
