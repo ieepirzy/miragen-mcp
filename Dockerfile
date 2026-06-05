@@ -3,8 +3,9 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && adduser --disabled-password --gecos "" mcpuser
+RUN adduser --disabled-password --gecos "" mcpuser \
+    && groupadd -g 988 docker \
+    && usermod -aG docker mcpuser
 
 COPY server.py .
 
