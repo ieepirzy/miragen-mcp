@@ -5,13 +5,14 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt \
+    && apt-get update && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 988 docker \
     && adduser --disabled-password --gecos "" mcpuser \
     && usermod -aG docker mcpuser
 
-COPY server.py .
-
-USER mcpuser
+COPY entrypoint.sh server.py ./
+RUN chmod +x entrypoint.sh
 
 EXPOSE 8000
-CMD ["python", "server.py"]
+ENTRYPOINT ["./entrypoint.sh"]
