@@ -106,7 +106,7 @@ def _compose_add_service(name: str) -> None:
     secret_names = _secret_names()
     env = {"AGENT_PROFILE": "agent.yaml"}
     for k, v in os.environ.items():
-        if k.endswith("_API_KEY_FILE") and v:
+        if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
             env[k] = v
 
     data = _compose_load()
