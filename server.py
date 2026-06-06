@@ -87,23 +87,37 @@ def _compose_load() -> dict:
     if COMPOSE_FILE.exists():
         return _read_yaml(COMPOSE_FILE)
     return {
-        "secrets": {"anthropic_key": {"external": True}},
+        "secrets": {k: {"external": True} for k in _secret_names()},
         "services": {},
         "networks": {"miragen-net": {"external": True}},
     }
 
 
+def _secret_names() -> list[str]:
+    """Derive Docker secret names from *_API_KEY_FILE env vars on this container."""
+    secrets = []
+    for k, v in os.environ.items():
+        if k.endswith("_API_KEY_FILE"):
+            # ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key → "anthropic_key"
+            secrets.append(Path(v).name)
+    return secrets
+
+
 def _compose_add_service(name: str) -> None:
+    secret_names = _secret_names()
+    env = {"AGENT_PROFILE": "agent.yaml"}
+    for k, v in os.environ.items():
+        if k.endswith("_API_KEY_FILE"):
+            env[k] = v
+
     data = _compose_load()
+    data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
     data.setdefault("services", {})[name] = {
         "image": MIRAGEN_BASE_IMAGE,
         "container_name": name,
         "restart": "unless-stopped",
-        "secrets": ["anthropic_key"],
-        "environment": {
-            "ANTHROPIC_API_KEY_FILE": "/run/secrets/anthropic_key",
-            "AGENT_PROFILE": "agent.yaml",
-        },
+        "secrets": secret_names,
+        "environment": env,
         "volumes": [f"./agents/{name}:/agent"],
         "networks": ["miragen-net"],
     }
