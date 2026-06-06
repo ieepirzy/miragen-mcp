@@ -511,18 +511,18 @@ def edit_agent_file(agent: str, path: str, old_str: str, new_str: str) -> str:
 # ---- Scheduling -------------------------------------------------------------
 
 
-async def _fire_trigger(agent: str) -> None:
+async def _fire_trigger(agent: str, prompt: str) -> None:
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"http://{agent}:8000/run", json={"prompt": ""}, timeout=10)
+            resp = await client.post(f"http://{agent}:8000/run", json={"prompt": prompt}, timeout=10)
             resp.raise_for_status()
         except Exception as exc:
             logger.error("retrigger POST to %s failed: %s", agent, exc)
 
 
 @mcp.tool()
-def set_retrigger(agent: str, delay_seconds: int | None = None, at: str | None = None) -> str:
-    """Schedule a one-shot POST to the agent's /run endpoint. Provide delay_seconds OR at (ISO datetime)."""
+def set_retrigger(agent: str, prompt: str, delay_seconds: int | None = None, at: str | None = None) -> str:
+    """Schedule a one-shot POST to the agent's /run endpoint with the given prompt. Provide delay_seconds OR at (ISO datetime)."""
     if (delay_seconds is None) == (at is None):
         return "ERROR: provide exactly one of delay_seconds or at"
     try:
@@ -536,11 +536,30 @@ def set_retrigger(agent: str, delay_seconds: int | None = None, at: str | None =
         _scheduler.add_job(
             _fire_trigger,
             trigger=DateTrigger(run_date=fire_at),
-            args=[agent],
+            args=[agent, prompt],
             id=f"retrigger-{agent}-{fire_at.timestamp():.0f}",
             replace_existing=True,
         )
         return f"Retrigger scheduled for {agent} at {fire_at.isoformat()}."
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+# ---- Agent communication ----------------------------------------------------
+
+
+@mcp.tool()
+async def run_agent(agent: str, prompt: str) -> str:
+    """Send a prompt to a running agent's /run endpoint and return its response."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"http://{agent}:8000/run",
+                json={"prompt": prompt},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            return resp.json().get("output", resp.text)
     except Exception as exc:
         return f"ERROR: {exc}"
 

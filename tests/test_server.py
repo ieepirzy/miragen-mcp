@@ -173,16 +173,16 @@ def test_edit_agent_file_missing_file(tmp_path, monkeypatch):
 # ── set_retrigger arg validation ──────────────────────────────────────────────
 
 def test_retrigger_neither_arg():
-    assert server.set_retrigger("agent").startswith("ERROR:")
+    assert server.set_retrigger("agent", "do something").startswith("ERROR:")
 
 
 def test_retrigger_both_args():
-    assert server.set_retrigger("agent", delay_seconds=10, at="2030-01-01T00:00:00").startswith("ERROR:")
+    assert server.set_retrigger("agent", "do something", delay_seconds=10, at="2030-01-01T00:00:00").startswith("ERROR:")
 
 
 def test_retrigger_delay(monkeypatch):
     monkeypatch.setattr(server, "_scheduler", pytest.importorskip("unittest.mock").MagicMock())
-    result = server.set_retrigger("agent", delay_seconds=60)
+    result = server.set_retrigger("agent", "do something", delay_seconds=60)
     assert "agent" in result
     assert result.startswith("Retrigger scheduled")
 
