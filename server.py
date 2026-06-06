@@ -89,7 +89,7 @@ def _compose_load() -> dict:
     return {
         "secrets": {k: {"external": True} for k in _secret_names()},
         "services": {},
-        "networks": {"miragen-net": {"name": "miragen-net", "attachable": True}},
+        "networks": {"miragen-net": {"external": True}},
     }
 
 
@@ -118,7 +118,7 @@ def _compose_add_service(name: str) -> None:
             env[k] = v
 
     data = _compose_load()
-    data["networks"] = {"miragen-net": {"name": "miragen-net", "attachable": True}}
+    data["networks"] = {"miragen-net": {"external": True}}
     data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
     data.setdefault("services", {})[name] = {
         "image": MIRAGEN_BASE_IMAGE,
