@@ -37,3 +37,4 @@ networks:
   proxy:
     external: true
   miragen-net:
+    name: miragen-net
