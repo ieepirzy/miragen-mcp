@@ -1,4 +1,7 @@
-
+# ── miragen-mcp ───────────────────────────────────────────────────────────────
+# All API keys are passed as plain environment variables.
+# Set them in your shell, .env file, or Portainer stack environment vars UI.
+# For Docker secrets (docker compose direct deployment), use compose.secrets.yml.
 
 services:
   miragen-mcp:
@@ -14,13 +17,22 @@ services:
       MCP_BASE_URL: ${MCP_BASE_URL}
       MCP_CLIENT_ID: ${MCP_CLIENT_ID}
       MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
     ports:
       - "127.0.0.1:6967:8000"
     networks:
       - proxy
     security_opt:
-    - no-new-privileges:true
+      - no-new-privileges:true
 
 networks:
   proxy:
     external: true
+  miragen-net:

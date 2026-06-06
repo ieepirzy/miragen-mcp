@@ -94,11 +94,10 @@ def _compose_load() -> dict:
 
 
 def _secret_names() -> list[str]:
-    """Derive Docker secret names from *_API_KEY_FILE env vars on this container."""
+    """Derive Docker secret names from non-empty *_API_KEY_FILE env vars on this container."""
     secrets = []
     for k, v in os.environ.items():
-        if k.endswith("_API_KEY_FILE"):
-            # ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key → "anthropic_key"
+        if k.endswith("_API_KEY_FILE") and v:
             secrets.append(Path(v).name)
     return secrets
 
@@ -107,7 +106,7 @@ def _compose_add_service(name: str) -> None:
     secret_names = _secret_names()
     env = {"AGENT_PROFILE": "agent.yaml"}
     for k, v in os.environ.items():
-        if k.endswith("_API_KEY_FILE"):
+        if k.endswith("_API_KEY_FILE") and v:
             env[k] = v
 
     data = _compose_load()
