@@ -102,7 +102,15 @@ def _secret_names() -> list[str]:
     return secrets
 
 
+def _ensure_agent_network() -> None:
+    try:
+        _docker.networks.get("miragen-net")
+    except docker.errors.NotFound:
+        _docker.networks.create("miragen-net", driver="bridge")
+
+
 def _compose_add_service(name: str) -> None:
+    _ensure_agent_network()
     secret_names = _secret_names()
     env = {"AGENT_PROFILE": "agent.yaml"}
     for k, v in os.environ.items():
@@ -609,6 +617,7 @@ _original_lifespan = app.router.lifespan_context
 @asynccontextmanager
 async def _lifespan(scope):
     async with _original_lifespan(scope):
+        _ensure_agent_network()
         _scheduler.start()
         yield
         _scheduler.shutdown(wait=False)
