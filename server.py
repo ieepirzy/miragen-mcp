@@ -32,7 +32,7 @@ COMPOSE_FILE = WORKSPACE / "compose.yml"
 BASE_URL = os.getenv("MCP_BASE_URL")
 CLIENT_ID = os.getenv("MCP_CLIENT_ID", "miragen-mcp")
 CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "changeme")
-MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "miragen:latest")
+MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest")
 
 # ---------------------------------------------------------------------------
 # Shared state
