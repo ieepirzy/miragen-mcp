@@ -106,7 +106,7 @@ def _ensure_agent_network() -> None:
     try:
         _docker.networks.get("miragen-net")
     except docker.errors.NotFound:
-        _docker.networks.create("miragen-net", driver="bridge")
+        _docker.networks.create("miragen-net", driver="bridge", attachable=True)
 
 
 def _compose_add_service(name: str) -> None:
