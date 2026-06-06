@@ -254,6 +254,23 @@ def create_agent(name: str, yaml_source: str) -> str:
 
 
 @mcp.tool()
+def start_agent(name: str) -> str:
+    """Start an agent container via docker compose (works even if container doesn't exist yet)."""
+    if not _agent_dir(name).exists():
+        return f"ERROR: agent '{name}' not found in workspace"
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "up", "-d", name],
+            capture_output=True, text=True, cwd=WORKSPACE,
+        )
+        if result.returncode != 0:
+            return f"ERROR: {result.stderr.strip()}"
+        return f"Agent {name} started."
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@mcp.tool()
 def restart_agent(name: str) -> str:
     """Restart the Docker container for an agent."""
     try:
