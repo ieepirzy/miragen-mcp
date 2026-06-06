@@ -89,7 +89,7 @@ def _compose_load() -> dict:
     return {
         "secrets": {k: {"external": True} for k in _secret_names()},
         "services": {},
-        "networks": {"miragen-net": {"external": True}},
+        "networks": {"miragen-net": {"name": "miragen-net", "attachable": True}},
     }
 
 
