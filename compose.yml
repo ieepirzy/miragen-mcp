@@ -10,7 +10,7 @@ services:
       - /opt/miragen:/opt/miragen
     environment:
       MIRAGEN_WORKSPACE: /opt/miragen
-      MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-miragen:latest}
+      MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
       MCP_BASE_URL: ${MCP_BASE_URL}
       MCP_CLIENT_ID: ${MCP_CLIENT_ID}
       MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
