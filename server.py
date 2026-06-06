@@ -28,9 +28,11 @@ from starlette.routing import Route
 
 WORKSPACE = Path(os.getenv("MIRAGEN_WORKSPACE", "/opt/miragen"))
 AGENTS_DIR = WORKSPACE / "agents"
+COMPOSE_FILE = WORKSPACE / "compose.yml"
 BASE_URL = os.getenv("MCP_BASE_URL")
 CLIENT_ID = os.getenv("MCP_CLIENT_ID", "miragen-mcp")
 CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "changeme")
+MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "miragen:latest")
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -79,6 +81,41 @@ def _read_yaml(path: Path) -> dict:
 def _write_yaml(path: Path, data: dict) -> None:
     with open(path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+def _compose_load() -> dict:
+    if COMPOSE_FILE.exists():
+        return _read_yaml(COMPOSE_FILE)
+    return {
+        "secrets": {"anthropic_key": {"external": True}},
+        "services": {},
+        "networks": {"miragen-net": {"external": True}},
+    }
+
+
+def _compose_add_service(name: str) -> None:
+    data = _compose_load()
+    data.setdefault("services", {})[name] = {
+        "image": MIRAGEN_BASE_IMAGE,
+        "container_name": name,
+        "restart": "unless-stopped",
+        "secrets": ["anthropic_key"],
+        "environment": {
+            "ANTHROPIC_API_KEY_FILE": "/run/secrets/anthropic_key",
+            "AGENT_PROFILE": "agent.yaml",
+        },
+        "volumes": [f"./agents/{name}:/agent"],
+        "networks": ["miragen-net"],
+    }
+    _write_yaml(COMPOSE_FILE, data)
+
+
+def _compose_remove_service(name: str) -> None:
+    if not COMPOSE_FILE.exists():
+        return
+    data = _compose_load()
+    data.get("services", {}).pop(name, None)
+    _write_yaml(COMPOSE_FILE, data)
 
 
 def _parse_registered_tools(source: str) -> list[dict]:
@@ -180,7 +217,7 @@ def get_agent(name: str) -> dict:
 
 @mcp.tool()
 def create_agent(name: str, yaml_source: str) -> str:
-    """Create a new agent directory, validate the yaml, write stubs, and start the container."""
+    """Create a new agent workspace, register it in the central compose.yml, and start the container."""
     d = _agent_dir(name)
     if d.exists():
         return f"ERROR: agent '{name}' already exists"
@@ -199,39 +236,16 @@ def create_agent(name: str, yaml_source: str) -> str:
 
         (d / "tools.py").write_text(f"from miragen import register\n\n# Tools for {name}\n")
 
-        (d / "compose.yml").write_text(
-            f"x-agent-base: &agent-base\n"
-            f"  build: .\n"
-            f"  restart: unless-stopped\n"
-            f"  secrets: [anthropic_key]\n"
-            f"\n"
-            f"services:\n"
-            f"  {name}:\n"
-            f"    <<: *agent-base\n"
-            f"    container_name: {name}\n"
-            f"    environment:\n"
-            f"      ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key\n"
-            f"      AGENT_PROFILE: agents/{name}/agent.yaml\n"
-            f"    volumes:\n"
-            f"      - {WORKSPACE}/agents/{name}:/app/agent\n"
-            f"    networks:\n"
-            f"      - miragen-net\n"
-            f"\n"
-            f"networks:\n"
-            f"  miragen-net:\n"
-            f"    external: true\n"
-            f"\n"
-            f"secrets:\n"
-            f"  anthropic_key:\n"
-            f"    external: true\n"
-        )
+        _compose_add_service(name)
 
         up = subprocess.run(
-            ["docker", "compose", "up", "-d"],
-            capture_output=True, text=True, cwd=d,
+            ["docker", "compose", "up", "-d", name],
+            capture_output=True, text=True, cwd=WORKSPACE,
         )
         if up.returncode != 0:
-            return f"ERROR: agent files created but container failed to start:\n{up.stderr.strip()}"
+            _compose_remove_service(name)
+            shutil.rmtree(d)
+            return f"ERROR: container failed to start:\n{up.stderr.strip()}"
 
         return f"Agent {name} created and started."
     except Exception as exc:
@@ -265,7 +279,7 @@ def stop_agent(name: str) -> str:
 
 @mcp.tool()
 def delete_agent(name: str) -> str:
-    """Stop and remove the container, then delete the agent workspace."""
+    """Stop and remove the container, remove from central compose.yml, delete workspace."""
     d = _agent_dir(name)
     try:
         try:
@@ -276,6 +290,7 @@ def delete_agent(name: str) -> str:
             pass
         except Exception as exc:
             return f"ERROR: {exc}"
+        _compose_remove_service(name)
         if d.exists():
             shutil.rmtree(d)
         return f"Agent {name} deleted."
