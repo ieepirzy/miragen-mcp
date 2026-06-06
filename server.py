@@ -449,12 +449,12 @@ def delete_tool(agent: str, tool_name: str) -> str:
     return restart_agent(agent)
 
 
-# ---- Filesystem tools -------------------------------------------------------
+# ---- Agent filesystem tools -------------------------------------------------
 
 
 @mcp.tool()
-def read_file(agent: str, path: str) -> str:
-    """Read a file from the agent workspace. Path is relative to the agent directory."""
+def read_agent_file(agent: str, path: str) -> str:
+    """Read a file from an agent's workspace on the shared volume. The workspace is volume-mounted as /agent inside the agent container — this is NOT the MCP server's own filesystem. Path is relative to the agent directory."""
     full, err = _safe_path(agent, path)
     if err:
         return err
@@ -467,8 +467,8 @@ def read_file(agent: str, path: str) -> str:
 
 
 @mcp.tool()
-def write_file(agent: str, path: str, content: str) -> str:
-    """Overwrite (or create) a file in the agent workspace."""
+def write_agent_file(agent: str, path: str, content: str) -> str:
+    """Write (or overwrite) a file in an agent's workspace on the shared volume — NOT the MCP server's filesystem. The file is immediately visible inside the agent container at /agent/<path>."""
     full, err = _safe_path(agent, path)
     if err:
         return err
@@ -481,8 +481,8 @@ def write_file(agent: str, path: str, content: str) -> str:
 
 
 @mcp.tool()
-def edit_file(agent: str, path: str, old_str: str, new_str: str) -> str:
-    """str_replace on a file in the agent workspace — old_str must appear exactly once."""
+def edit_agent_file(agent: str, path: str, old_str: str, new_str: str) -> str:
+    """str_replace on a file in an agent's workspace on the shared volume — NOT the MCP server's filesystem. old_str must appear exactly once. The change is immediately visible inside the agent container at /agent/<path>."""
     full, err = _safe_path(agent, path)
     if err:
         return err

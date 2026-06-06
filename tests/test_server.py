@@ -110,64 +110,64 @@ def test_find_span_invalid_syntax():
     assert server._find_function_span("def (broken:", "foo") is None
 
 
-# ── read_file / write_file / edit_file ────────────────────────────────────────
+# ── read_agent_file / write_agent_file / edit_agent_file ──────────────────────
 
-def test_read_file(tmp_path, monkeypatch):
+def test_read_agent_file(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     d = tmp_path / "agents" / "a"
     d.mkdir(parents=True)
     (d / "data.txt").write_text("hello")
-    assert server.read_file("a", "data.txt") == "hello"
+    assert server.read_agent_file("a", "data.txt") == "hello"
 
 
-def test_read_file_missing(tmp_path, monkeypatch):
+def test_read_agent_file_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     (tmp_path / "agents" / "a").mkdir(parents=True)
-    assert server.read_file("a", "nope.txt").startswith("ERROR:")
+    assert server.read_agent_file("a", "nope.txt").startswith("ERROR:")
 
 
-def test_read_file_traversal(tmp_path, monkeypatch):
+def test_read_agent_file_traversal(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    assert server.read_file("a", "../b/secret.txt").startswith("ERROR:")
+    assert server.read_agent_file("a", "../b/secret.txt").startswith("ERROR:")
 
 
-def test_write_file_creates_parents(tmp_path, monkeypatch):
+def test_write_agent_file_creates_parents(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     (tmp_path / "agents" / "a").mkdir(parents=True)
-    server.write_file("a", "sub/out.txt", "content")
+    server.write_agent_file("a", "sub/out.txt", "content")
     assert (tmp_path / "agents" / "a" / "sub" / "out.txt").read_text() == "content"
 
 
-def test_edit_file_success(tmp_path, monkeypatch):
+def test_edit_agent_file_success(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     d = tmp_path / "agents" / "a"
     d.mkdir(parents=True)
     (d / "f.txt").write_text("foo bar baz")
-    assert server.edit_file("a", "f.txt", "bar", "qux") == "Edited f.txt"
+    assert server.edit_agent_file("a", "f.txt", "bar", "qux") == "Edited f.txt"
     assert (d / "f.txt").read_text() == "foo qux baz"
 
 
-def test_edit_file_no_match(tmp_path, monkeypatch):
+def test_edit_agent_file_no_match(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     d = tmp_path / "agents" / "a"
     d.mkdir(parents=True)
     (d / "f.txt").write_text("hello")
-    assert server.edit_file("a", "f.txt", "nope", "x").startswith("ERROR:")
+    assert server.edit_agent_file("a", "f.txt", "nope", "x").startswith("ERROR:")
 
 
-def test_edit_file_ambiguous(tmp_path, monkeypatch):
+def test_edit_agent_file_ambiguous(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     d = tmp_path / "agents" / "a"
     d.mkdir(parents=True)
     (d / "f.txt").write_text("x x x")
-    result = server.edit_file("a", "f.txt", "x", "y")
+    result = server.edit_agent_file("a", "f.txt", "x", "y")
     assert "3 times" in result
 
 
-def test_edit_file_missing_file(tmp_path, monkeypatch):
+def test_edit_agent_file_missing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     (tmp_path / "agents" / "a").mkdir(parents=True)
-    assert server.edit_file("a", "missing.txt", "x", "y").startswith("ERROR:")
+    assert server.edit_agent_file("a", "missing.txt", "x", "y").startswith("ERROR:")
 
 
 # ── set_retrigger arg validation ──────────────────────────────────────────────
