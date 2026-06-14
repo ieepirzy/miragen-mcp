@@ -35,6 +35,7 @@ CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "changeme")
 AUTO_APPROVE = os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true"
 PUBLIC_REGISTRATION = os.getenv("MCP_PUBLIC_REGISTRATION", "false").lower() == "true"
 NO_AUTH = os.getenv("MCP_NO_AUTH", "false").lower() == "true"
+MCP_PATH = os.getenv("MCP_PATH", "/mcp")
 MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest")
 
 # ---------------------------------------------------------------------------
@@ -608,7 +609,7 @@ def validate_yaml(source: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-app = mcp.http_app(stateless_http=True)
+app = mcp.http_app(stateless_http=True, path=MCP_PATH)
 
 if not NO_AUTH:
     auth = OAuthProvider(
@@ -631,7 +632,7 @@ if not NO_AUTH:
     app.add_middleware(OAuthMiddleware, provider=auth)
 
     app.state.base_url = BASE_URL
-    app.state.mcp_path = "/mcp"
+    app.state.mcp_path = MCP_PATH
     app.state.storage = auth.storage
     app.state.public_registration = auth.public_registration
     app.state.auto_approve = auth.auto_approve
