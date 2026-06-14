@@ -634,7 +634,7 @@ if not NO_AUTH:
     app.state.mcp_path = "/mcp"
     app.state.storage = auth.storage
     app.state.public_registration = auth.public_registration
-app.state.auto_approve = auth.auto_approve
+    app.state.auto_approve = auth.auto_approve
 
 
 _original_lifespan = app.router.lifespan_context
