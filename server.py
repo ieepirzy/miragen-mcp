@@ -32,6 +32,8 @@ COMPOSE_FILE = WORKSPACE / "compose.yml"
 BASE_URL = os.getenv("MCP_BASE_URL")
 CLIENT_ID = os.getenv("MCP_CLIENT_ID", "miragen-mcp")
 CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "changeme")
+AUTO_APPROVE = os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true"
+PUBLIC_REGISTRATION = os.getenv("MCP_PUBLIC_REGISTRATION", "false").lower() == "true"
 MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest")
 
 # ---------------------------------------------------------------------------
@@ -609,6 +611,8 @@ auth = OAuthProvider(
     base_url=BASE_URL,
     clients={CLIENT_ID: CLIENT_SECRET},
     token_ttl=604800,
+    auto_approve=AUTO_APPROVE,
+    public_registration=PUBLIC_REGISTRATION,
 )
 
 app = mcp.http_app(stateless_http=True)
