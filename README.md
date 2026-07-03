@@ -33,28 +33,32 @@ Claude / AI Client
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `list_agents` | List all agents with status, mode, and model |
-| `get_agent` | Full agent info: YAML config, container status, tools |
-| `create_agent` | Create workspace, register in compose, start container |
-| `start_agent` | Start agent container |
-| `restart_agent` | Restart agent container |
-| `stop_agent` | Stop agent container |
-| `delete_agent` | Stop, remove container, and delete workspace |
-| `get_agent_logs` | Tail Docker container logs |
-| `list_tools` | List `@register` tools in agent's `tools.py` |
-| `get_tool_source` | Get source code of a specific tool |
-| `register_tool` | Append new tool to `tools.py` and update `agent.yaml` |
-| `edit_tool` | String-replace edit a tool (restarts agent) |
-| `delete_tool` | Remove tool from `tools.py` and `agent.yaml` |
-| `read_agent_file` | Read a file from agent workspace |
-| `write_agent_file` | Write/create a file in agent workspace |
-| `edit_agent_file` | String-replace edit a file in agent workspace |
-| `run_agent` | Send a prompt to agent's `/run` endpoint |
-| `set_retrigger` | Schedule a one-shot prompt (delay or absolute time) |
-| `validate_yaml` | Validate agent YAML using miragen CLI |
-| `get_miragen_readme` | Fetch latest Miragen README from GitHub |
+All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP servers, and each declares MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so clients can distinguish safe reads from destructive operations.
+
+| Tool | Hints | Description |
+|------|-------|-------------|
+| `miragen_list_agents` | read-only | List all agents with status, mode, and model |
+| `miragen_get_agent` | read-only | Full agent info: YAML config, container status, tools |
+| `miragen_create_agent` | write | Create workspace, register in compose, start container |
+| `miragen_start_agent` | write, idempotent | Start agent container |
+| `miragen_restart_agent` | write, idempotent | Restart agent container |
+| `miragen_stop_agent` | write, idempotent | Stop agent container |
+| `miragen_delete_agent` | **destructive** | Stop, remove container, and delete workspace |
+| `miragen_get_agent_logs` | read-only | Tail Docker container logs (max 1000 lines) |
+| `miragen_list_tools` | read-only | List `@register` tools in agent's `tools.py` |
+| `miragen_get_tool_source` | read-only | Get source code of a specific tool |
+| `miragen_register_tool` | write | Append new tool to `tools.py` and update `agent.yaml` |
+| `miragen_edit_tool` | **destructive** | String-replace edit a tool (restarts agent) |
+| `miragen_delete_tool` | **destructive** | Remove tool from `tools.py` and `agent.yaml` |
+| `miragen_read_agent_file` | read-only | Read a file from agent workspace |
+| `miragen_write_agent_file` | **destructive** | Write/create a file in agent workspace |
+| `miragen_edit_agent_file` | **destructive** | String-replace edit a file in agent workspace |
+| `miragen_run_agent` | open-world | Send a prompt to agent's `/run` endpoint |
+| `miragen_set_retrigger` | open-world | Schedule a one-shot prompt (delay or absolute time) |
+| `miragen_validate_yaml` | read-only | Validate agent YAML using miragen CLI |
+| `miragen_get_readme` | read-only | Fetch latest Miragen README from GitHub |
+
+Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double as Docker container names, and this blocks path traversal), `miragen_register_tool` syntax-checks the submitted source and requires it to define the named `@register` function, and unbounded outputs (logs, file reads, agent responses) are truncated at 50,000 characters.
 
 ## Requirements
 

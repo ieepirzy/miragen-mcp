@@ -223,6 +223,107 @@ def test_register_tool_success(tmp_path, monkeypatch):
     assert "my_tool" in yaml_data["tools"]
 
 
+# ── agent name validation ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("bad", ["../escape", "UPPER", "has space", "", ".hidden", "a/b"])
+def test_invalid_agent_names_rejected(bad):
+    assert server._check_agent_name(bad) is not None
+
+
+@pytest.mark.parametrize("good", ["a", "morning-briefing", "agent_2", "0abc"])
+def test_valid_agent_names_accepted(good):
+    assert server._check_agent_name(good) is None
+
+
+def test_read_agent_file_agent_name_traversal(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "secret.txt").write_text("top secret")
+    result = server.read_agent_file("..", "secret.txt")
+    assert result.startswith("ERROR:")
+
+
+def test_get_agent_invalid_name():
+    result = server.get_agent("../../etc")
+    assert "error" in result
+    assert result["error"].startswith("ERROR:")
+
+
+def test_create_agent_invalid_name():
+    assert server.create_agent("Bad Name", "name: x").startswith("ERROR:")
+
+
+# ── register_tool source validation ──────────────────────────────────────────
+
+def test_register_tool_rejects_invalid_syntax(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig = "from miragen import register\n"
+    (d / "tools.py").write_text(orig)
+    result = server.register_tool("a", "broken", "def (broken:")
+    assert result.startswith("ERROR:")
+    assert "valid Python" in result
+    assert (d / "tools.py").read_text() == orig
+
+
+def test_register_tool_rejects_name_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig = "from miragen import register\n"
+    (d / "tools.py").write_text(orig)
+    result = server.register_tool("a", "expected", "@register\nasync def other(ctx): pass\n")
+    assert result.startswith("ERROR:")
+    assert "expected" in result
+    assert (d / "tools.py").read_text() == orig
+
+
+def test_register_tool_accepts_named_decorator(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "tools.py").write_text("from miragen import register\n")
+    (d / "agent.yaml").write_text("name: a\ntools: []\n")
+    result = server.register_tool("a", "speak", '@register("speak")\nasync def tts(ctx, text: str): pass\n')
+    assert "registered" in result
+
+
+# ── output truncation ─────────────────────────────────────────────────────────
+
+def test_truncate_short_passthrough():
+    assert server._truncate("abc") == "abc"
+
+
+def test_truncate_long_output():
+    result = server._truncate("x" * 60_000)
+    assert len(result) < 60_000
+    assert "TRUNCATED" in result
+
+
+def test_read_agent_file_truncates(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "big.txt").write_text("y" * (server.MAX_OUTPUT_CHARS + 1000))
+    result = server.read_agent_file("a", "big.txt")
+    assert "TRUNCATED" in result
+
+
+# ── set_retrigger datetime validation ─────────────────────────────────────────
+
+def test_retrigger_invalid_iso():
+    result = server.set_retrigger("agent", "go", at="not-a-date")
+    assert result.startswith("ERROR:")
+    assert "ISO 8601" in result
+
+
+def test_retrigger_past_datetime():
+    result = server.set_retrigger("agent", "go", at="2000-01-01T00:00:00+00:00")
+    assert result.startswith("ERROR:")
+    assert "past" in result
+
+
 # ── delete_tool ───────────────────────────────────────────────────────────────
 
 def test_delete_tool_removes_function_and_yaml_entry(tmp_path, monkeypatch):

@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # conftest.py stubs docker, fastmcp, origo, apscheduler and friends,
+      # so only the light runtime deps are needed to run the suite.
+      - run: pip install pytest httpx pyyaml pydantic
+      # python -m pytest (not bare pytest) so the repo root — where server.py
+      # lives — is on sys.path for the test imports.
+      - run: python -m pytest tests/ -q
