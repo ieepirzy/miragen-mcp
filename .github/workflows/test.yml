@@ -16,4 +16,6 @@ jobs:
       # conftest.py stubs docker, fastmcp, origo, apscheduler and friends,
       # so only the light runtime deps are needed to run the suite.
       - run: pip install pytest httpx pyyaml pydantic
-      - run: pytest tests/ -q
+      # python -m pytest (not bare pytest) so the repo root — where server.py
+      # lives — is on sys.path for the test imports.
+      - run: python -m pytest tests/ -q
