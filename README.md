@@ -70,32 +70,44 @@ Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double
 
 ### Docker Compose (recommended)
 
-`compose.yml` alone has no ingress — it deploys but nothing can reach it. Two
-environments run this service and they need **opposite** ingress shapes, so pick
-the overlay for yours:
+Two environments run this service and need **opposite** ingress shapes. One
+`compose.yml` handles both, selected by `COMPOSE_PROFILES` — no `-f` flags, no
+second file, because Portainer locks a git-stack's Compose path at creation and
+gives no way to layer a second file onto a stack that already exists:
 
 ```bash
 # VPS: NPM runs on the same host, reached by container-name DNS over a shared
 # `proxy` network (which NPM's own stack must already have created).
-docker compose -f compose.yml -f compose.vps.yml up -d --build
+DOCKER_GID=$(getent group docker | cut -d: -f3) \
+  COMPOSE_PROFILES=vps docker compose up -d --build
 
 # homelab (or anywhere the reverse proxy is on a different machine): published
 # on loopback plus BOUND_IP, which should be this host's WireGuard address.
 DOCKER_GID=$(getent group docker | cut -d: -f3) BOUND_IP=10.x.x.x \
-  docker compose -f compose.yml -f compose.homelab.yml up -d --build
+  COMPOSE_PROFILES=homelab docker compose up -d --build
 ```
 
-In Portainer, set the stack's **Compose path** to both files, comma-separated
-(e.g. `compose.yml,compose.vps.yml`). `DOCKER_GID` is always required — it must
-match `getent group docker | cut -d: -f3` **on the deployment host**, not
-wherever you're reading this from, or the container cannot reach
-`/var/run/docker.sock`.
+In Portainer, set `COMPOSE_PROFILES` (`vps` or `homelab`) as a stack environment
+variable — that's editable at any time, unlike the Compose path. `DOCKER_GID` is
+always required — it must match `getent group docker | cut -d: -f3` **on the
+deployment host**, not wherever you're reading this from, or the container
+cannot reach `/var/run/docker.sock`.
 
-> **Do not merge the two overlays' concerns back into `compose.yml`.** That
-> already broke production once: adding the homelab's port-publish there meant
-> also dropping the VPS's `proxy` network (compose hard-fails if `external:
-> true` is declared for a network the host doesn't have), and NPM lost
-> `miragen-mcp:8000` — a live 502 until this file was split.
+> **Do not make `BOUND_IP` a required var (`:?`) in compose.yml.** Compose
+> interpolates every service block in the file up front regardless of which
+> profile is active, so a required var referenced only by the homelab service
+> would block a VPS deploy that (correctly) never sets it. It defaults to
+> `127.0.0.1` instead — forgetting it fails safe (loopback-only, unreachable)
+> rather than failing the whole file to load. Verified with `docker compose up`
+> under both profiles, not just `config` — `config` alone doesn't surface this,
+> since interpolation happens either way.
+>
+> **Do not give both ingress shapes to one service block.** That broke
+> production once already: adding the homelab's port-publish unconditionally
+> meant also dropping the VPS's `proxy` network (compose hard-fails if
+> `external: true` is declared for a network the host doesn't have), and NPM
+> lost `miragen-mcp:8000` — a live 502 until this was split into two
+> profile-gated services in the same file.
 
 ### Docker (single container, no ingress split)
 

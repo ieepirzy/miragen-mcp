@@ -1,65 +1,102 @@
-# ── miragen-mcp (base) ──────────────────────────────────────────────────────
+# ── miragen-mcp ───────────────────────────────────────────────────────────────
 # All API keys are passed as plain environment variables.
 # Set them in your shell, .env file, or Portainer stack environment vars UI.
 # For Docker secrets (docker compose direct deployment), use compose.secrets.yml.
 #
-# This file alone is not a deployable topology -- it has no ingress. Two
-# environments run this service and they need OPPOSITE ingress shapes:
-#   - VPS:     alongside NPM, reachable by container-name DNS over a shared
-#              `proxy` network. No host port needs publishing.
-#   - homelab: NPM lives on a different machine, so it must reach this over a
-#              published port on the WireGuard address instead.
-# One compose.yml serving both broke the VPS on 2026-07-14: adding the
-# homelab's BOUND_IP port binding here meant also dropping `proxy`, and the
-# VPS's NPM immediately lost `miragen-mcp:8000` -- 502, because compose
-# CANNOT declare `proxy: external: true` unconditionally when one target
-# (homelab) has no such network; it hard-fails to deploy there instead.
+# ONE file, TWO ingress shapes, selected by COMPOSE_PROFILES. This is deliberate:
+# Portainer locks the git-stack "Compose path" at creation and does not offer a
+# way to layer a second file onto an existing stack, so a base+overlay split
+# (two files, `-f a -f b`) cannot be adopted by a stack that already exists
+# without deleting and recreating it. Profiles select between two service
+# definitions in this single file using only an env var, which Portainer's
+# stack settings already let you edit freely -- no path change needed.
 #
-# Deploy with the file for your target layered on top of this one:
-#   VPS:     docker compose -f compose.yml -f compose.vps.yml up -d --build
-#   homelab: docker compose -f compose.yml -f compose.homelab.yml up -d --build
-# In Portainer, set "Compose path" to both files, comma-separated.
+#   COMPOSE_PROFILES=vps       -- alongside NPM on the same host, reached by
+#                                  container-name DNS over a shared `proxy`
+#                                  network. No host port needs publishing.
+#   COMPOSE_PROFILES=homelab   -- NPM is on a different machine, reached over
+#                                  WireGuard by IP. Needs a published port on
+#                                  BOUND_IP; has no `proxy` network to join.
+#
+# These two shapes are genuinely incompatible in one service definition: the
+# homelab has no `proxy` network, and declaring one `external: true`
+# unconditionally hard-fails the deploy there. That is exactly what broke
+# production on 2026-07-14 -- a fix for one target silently took out the
+# other on its next redeploy. Profiles make the two shapes mutually exclusive
+# by construction: only one service block is ever instantiated, so there is
+# no unconditional network declaration to get wrong.
+#
+# Deploy:
+#   docker compose --profile vps     up -d --build
+#   docker compose --profile homelab up -d --build
+# (or set COMPOSE_PROFILES=vps / =homelab in the environment -- Compose reads
+# it natively, which is what makes this work from Portainer's env var UI.)
+
+x-miragen-mcp-base: &miragen-mcp-base
+  build:
+    context: .
+    args:
+      # Must match the DOCKER GROUP GID ON THE HOST, or mcpuser lands in a
+      # group that does not own /var/run/docker.sock and every docker call
+      # fails with "permission denied". Find it with:
+      #   getent group docker | cut -d: -f3
+      DOCKER_GID: ${DOCKER_GID:?set DOCKER_GID to the host's docker group gid}
+  container_name: miragen-mcp
+  restart: unless-stopped
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - /opt/miragen:/opt/miragen
+  environment:
+    MIRAGEN_WORKSPACE: /opt/miragen
+    MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
+    MCP_BASE_URL: ${MCP_BASE_URL}
+    MCP_CLIENT_ID: ${MCP_CLIENT_ID}
+    MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
+    MCP_AUTO_APPROVE: ${MCP_AUTO_APPROVE:-false}
+    MCP_PUBLIC_REGISTRATION: ${MCP_PUBLIC_REGISTRATION:-false}
+    MCP_NO_AUTH: ${MCP_NO_AUTH:-false}
+    MCP_PATH: ${MCP_PATH:-/mcp}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    XAI_API_KEY: ${XAI_API_KEY:-}
+    MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+    GROQ_API_KEY: ${GROQ_API_KEY:-}
+    COHERE_API_KEY: ${COHERE_API_KEY:-}
+  security_opt:
+    - no-new-privileges:true
 
 services:
   miragen-mcp:
-    build:
-      context: .
-      args:
-        # Must match the DOCKER GROUP GID ON THE HOST, or mcpuser lands in a
-        # group that does not own /var/run/docker.sock and every docker call
-        # fails with "permission denied". Find it with:
-        #   getent group docker | cut -d: -f3
-        DOCKER_GID: ${DOCKER_GID:?set DOCKER_GID to the host's docker group gid}
-    container_name: miragen-mcp
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/miragen:/opt/miragen
-    environment:
-      MIRAGEN_WORKSPACE: /opt/miragen
-      MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
-      MCP_BASE_URL: ${MCP_BASE_URL}
-      MCP_CLIENT_ID: ${MCP_CLIENT_ID}
-      MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
-      MCP_AUTO_APPROVE: ${MCP_AUTO_APPROVE:-false}
-      MCP_PUBLIC_REGISTRATION: ${MCP_PUBLIC_REGISTRATION:-false}
-      MCP_NO_AUTH: ${MCP_NO_AUTH:-false}
-      MCP_PATH: ${MCP_PATH:-/mcp}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      XAI_API_KEY: ${XAI_API_KEY:-}
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      COHERE_API_KEY: ${COHERE_API_KEY:-}
+    <<: *miragen-mcp-base
+    profiles: ["vps"]
     networks:
       - miragen-net
-    security_opt:
-      - no-new-privileges:true
+      - proxy
+
+  miragen-mcp-homelab:
+    <<: *miragen-mcp-base
+    profiles: ["homelab"]
+    ports:
+      # BOUND_IP defaults to loopback rather than being a required var (`:?`):
+      # Compose interpolates every service block in the file up front,
+      # regardless of which profile is active, so a required var referenced
+      # only here would block a VPS deploy that never sets it at all. Forgetting
+      # it fails safe -- the port only binds loopback, unreachable but not
+      # wide open -- rather than failing the whole file to load.
+      - "127.0.0.1:${PORT:-6967}:8000"
+      - "${BOUND_IP:-127.0.0.1}:${PORT:-6967}:8000"
+    networks:
+      - miragen-net
 
 networks:
   # Created by compose if absent, and by the server at runtime
   # (_ensure_agent_network) so spawned agents can always be attached to it.
   miragen-net:
     name: miragen-net
+  # Owned by NPM's own stack; only referenced under the vps profile, so this
+  # entry is never resolved (and never needs to exist) under the homelab
+  # profile.
+  proxy:
+    external: true
