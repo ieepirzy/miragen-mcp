@@ -1,7 +1,24 @@
-# ── miragen-mcp ───────────────────────────────────────────────────────────────
+# ── miragen-mcp (base) ──────────────────────────────────────────────────────
 # All API keys are passed as plain environment variables.
 # Set them in your shell, .env file, or Portainer stack environment vars UI.
 # For Docker secrets (docker compose direct deployment), use compose.secrets.yml.
+#
+# This file alone is not a deployable topology -- it has no ingress. Two
+# environments run this service and they need OPPOSITE ingress shapes:
+#   - VPS:     alongside NPM, reachable by container-name DNS over a shared
+#              `proxy` network. No host port needs publishing.
+#   - homelab: NPM lives on a different machine, so it must reach this over a
+#              published port on the WireGuard address instead.
+# One compose.yml serving both broke the VPS on 2026-07-14: adding the
+# homelab's BOUND_IP port binding here meant also dropping `proxy`, and the
+# VPS's NPM immediately lost `miragen-mcp:8000` -- 502, because compose
+# CANNOT declare `proxy: external: true` unconditionally when one target
+# (homelab) has no such network; it hard-fails to deploy there instead.
+#
+# Deploy with the file for your target layered on top of this one:
+#   VPS:     docker compose -f compose.yml -f compose.vps.yml up -d --build
+#   homelab: docker compose -f compose.yml -f compose.homelab.yml up -d --build
+# In Portainer, set "Compose path" to both files, comma-separated.
 
 services:
   miragen-mcp:
@@ -36,12 +53,6 @@ services:
       MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       COHERE_API_KEY: ${COHERE_API_KEY:-}
-    ports:
-      # Published on loopback plus BOUND_IP -- never 0.0.0.0. Point BOUND_IP at
-      # the host's WireGuard address so the port is reachable inside the mesh
-      # (and to a reverse proxy forwarding to it) but not from the LAN or WAN.
-      - "127.0.0.1:${PORT:-6967}:8000"
-      - "${BOUND_IP:-127.0.0.1}:${PORT:-6967}:8000"
     networks:
       - miragen-net
     security_opt:

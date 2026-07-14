@@ -68,10 +68,39 @@ Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double
 
 ## Installation
 
-### Docker (recommended)
+### Docker Compose (recommended)
+
+`compose.yml` alone has no ingress — it deploys but nothing can reach it. Two
+environments run this service and they need **opposite** ingress shapes, so pick
+the overlay for yours:
 
 ```bash
-docker build -t miragen-mcp .
+# VPS: NPM runs on the same host, reached by container-name DNS over a shared
+# `proxy` network (which NPM's own stack must already have created).
+docker compose -f compose.yml -f compose.vps.yml up -d --build
+
+# homelab (or anywhere the reverse proxy is on a different machine): published
+# on loopback plus BOUND_IP, which should be this host's WireGuard address.
+DOCKER_GID=$(getent group docker | cut -d: -f3) BOUND_IP=10.x.x.x \
+  docker compose -f compose.yml -f compose.homelab.yml up -d --build
+```
+
+In Portainer, set the stack's **Compose path** to both files, comma-separated
+(e.g. `compose.yml,compose.vps.yml`). `DOCKER_GID` is always required — it must
+match `getent group docker | cut -d: -f3` **on the deployment host**, not
+wherever you're reading this from, or the container cannot reach
+`/var/run/docker.sock`.
+
+> **Do not merge the two overlays' concerns back into `compose.yml`.** That
+> already broke production once: adding the homelab's port-publish there meant
+> also dropping the VPS's `proxy` network (compose hard-fails if `external:
+> true` is declared for a network the host doesn't have), and NPM lost
+> `miragen-mcp:8000` — a live 502 until this file was split.
+
+### Docker (single container, no ingress split)
+
+```bash
+docker build --build-arg DOCKER_GID=$(getent group docker | cut -d: -f3) -t miragen-mcp .
 docker run -d \
   --name miragen-mcp \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -79,7 +108,7 @@ docker run -d \
   -e MCP_BASE_URL=https://your-domain.example.com \
   -e MCP_CLIENT_SECRET=your-secret \
   -e ANTHROPIC_API_KEY=sk-ant-... \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   miragen-mcp
 ```
 

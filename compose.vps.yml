@@ -1,0 +1,18 @@
+# ── miragen-mcp: VPS overlay ─────────────────────────────────────────────────
+# For the VPS, where NPM runs alongside this container. NPM reaches it by
+# container-name DNS ("http://miragen-mcp:8000" as the NPM proxy-host target),
+# which requires sharing the `proxy` network -- no host port needs publishing.
+#
+# `proxy` must already exist on this host (created by NPM's own stack); it is
+# declared external because this stack does not own it.
+#
+# docker compose -f compose.yml -f compose.vps.yml up -d --build
+
+services:
+  miragen-mcp:
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
