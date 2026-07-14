@@ -7,12 +7,14 @@ WORKDIR /app
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
+ARG DOCKER_GID=988
+
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt \
     && apt-get update && apt-get install -y --no-install-recommends gosu \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 988 docker \
+    && groupadd -g "${DOCKER_GID}" docker \
     && adduser --disabled-password --gecos "" mcpuser \
     && usermod -aG docker mcpuser
 

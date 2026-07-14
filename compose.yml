@@ -5,7 +5,14 @@
 
 services:
   miragen-mcp:
-    build: .
+    build:
+      context: .
+      args:
+        # Must match the DOCKER GROUP GID ON THE HOST, or mcpuser lands in a
+        # group that does not own /var/run/docker.sock and every docker call
+        # fails with "permission denied". Find it with:
+        #   getent group docker | cut -d: -f3
+        DOCKER_GID: ${DOCKER_GID:?set DOCKER_GID to the host's docker group gid}
     container_name: miragen-mcp
     restart: unless-stopped
     volumes:
