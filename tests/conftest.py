@@ -6,6 +6,7 @@ installed into sys.modules before server.py is first imported by any test.
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from starlette.datastructures import State
 from unittest.mock import MagicMock
 
 # ── stdlib-only deps that may not be installed in dev ────────────────────────
@@ -52,10 +53,17 @@ _origo_provider = MagicMock(
     auto_approve=False,
 )
 
+# server.py adopts origo's routes and state from provider.asgi_app() rather than
+# re-declaring them, so the mock has to expose that shape: an app with iterable
+# routes and a Starlette-style State (its dict lives in `_state`).
+_origo_oauth_app = MagicMock()
+_origo_oauth_app.routes = []
+_origo_oauth_app.state = State()
+_origo_provider.asgi_app.return_value = _origo_oauth_app
+
 _origo_mod = MagicMock()
 _origo_mod.OAuthProvider.return_value = _origo_provider
 sys.modules["origo"] = _origo_mod
-sys.modules["origo.endpoints"] = MagicMock()
 
 
 # ── fastmcp ───────────────────────────────────────────────────────────────────

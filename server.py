@@ -21,9 +21,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from fastmcp import FastMCP
 from origo import OAuthMiddleware, OAuthProvider
-from origo.endpoints import authorize, oauth_metadata, protected_resource_metadata, register, token
 from pydantic import Field
-from starlette.routing import Route
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1105,24 +1103,24 @@ if not NO_AUTH:
         token_ttl=604800,
         auto_approve=AUTO_APPROVE,
         public_registration=PUBLIC_REGISTRATION,
+        mcp_path=MCP_PATH,
     )
 
-    for route in [
-        Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
-        Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
-        Route("/register", register, methods=["POST"]),
-        Route("/authorize", authorize, methods=["GET", "POST"]),
-        Route("/token", token, methods=["POST"]),
-    ]:
+    # Take origo's routes and state from the provider's own app rather than
+    # re-declaring them here. origo's endpoints read eleven app.state attributes
+    # and that set grows between versions (0.1.9 added allow_private_cimd as part
+    # of the SSRF fix). A hand-written subset imports fine and then 500s at
+    # request time on /authorize -- invisible until a client tries to authorise.
+    # Sourcing both from the provider means origo owns its own contract, and we
+    # also pick up /userinfo and /.well-known/openid-configuration for free.
+    oauth_app = auth.asgi_app()
+    for route in reversed(oauth_app.routes):
         app.router.routes.insert(0, route)
 
     app.add_middleware(OAuthMiddleware, provider=auth)
 
-    app.state.base_url = BASE_URL
-    app.state.mcp_path = MCP_PATH
-    app.state.storage = auth.storage
-    app.state.public_registration = auth.public_registration
-    app.state.auto_approve = auth.auto_approve
+    for _key, _value in vars(oauth_app.state)["_state"].items():
+        setattr(app.state, _key, _value)
 
 
 _original_lifespan = app.router.lifespan_context
