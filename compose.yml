@@ -37,15 +37,18 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       COHERE_API_KEY: ${COHERE_API_KEY:-}
     ports:
-      - "127.0.0.1:6967:8000"
+      # Published on loopback plus BOUND_IP -- never 0.0.0.0. Point BOUND_IP at
+      # the host's WireGuard address so the port is reachable inside the mesh
+      # (and to a reverse proxy forwarding to it) but not from the LAN or WAN.
+      - "127.0.0.1:${PORT:-6967}:8000"
+      - "${BOUND_IP:-127.0.0.1}:${PORT:-6967}:8000"
     networks:
-      - proxy
       - miragen-net
     security_opt:
       - no-new-privileges:true
 
 networks:
-  proxy:
-    external: true
+  # Created by compose if absent, and by the server at runtime
+  # (_ensure_agent_network) so spawned agents can always be attached to it.
   miragen-net:
     name: miragen-net
