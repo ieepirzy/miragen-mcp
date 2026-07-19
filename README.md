@@ -28,7 +28,7 @@ Claude / AI Client
 - **Filesystem access** — read, write, and edit files in agent workspaces with path traversal protection
 - **Prompt delivery** — send prompts to running agents and retrieve responses
 - **Scheduling** — schedule one-shot prompts with a delay or at a specific time (ISO 8601)
-- **Validation** — validate agent YAML profiles before applying them
+- **Validation** — validate agent YAML profiles before applying them, and update a running agent's `agent.yaml` through a validate → apply → restart → rollback flow instead of a raw file write
 - **Logging** — tail Docker container logs per agent
 
 ## Tools
@@ -40,6 +40,7 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_list_agents` | read-only | List all agents with status, mode, and model |
 | `miragen_get_agent` | read-only | Full agent info: YAML config, container status, tools |
 | `miragen_create_agent` | write | Create workspace, register in compose, start container |
+| `miragen_update_agent_config` | **destructive**, idempotent | Validate and replace an agent's `agent.yaml`, then restart (rolls back on failure) |
 | `miragen_start_agent` | write, idempotent | Start agent container |
 | `miragen_restart_agent` | write, idempotent | Restart agent container |
 | `miragen_stop_agent` | write, idempotent | Stop agent container |

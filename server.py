@@ -429,6 +429,94 @@ def create_agent(
 
 
 @mcp.tool(
+    name="miragen_update_agent_config",
+    annotations=_annotations("Update Agent Config", destructive=True, idempotent=True),
+)
+def update_agent_config(
+    agent: AgentName,
+    yaml_source: Annotated[
+        str,
+        Field(
+            description=(
+                "Complete replacement agent.yaml content. Fetch the current version with "
+                "miragen_get_agent first and edit it — this replaces the whole file. Must "
+                "keep 'name: <agent>'."
+            ),
+            min_length=1,
+        ),
+    ],
+) -> str:
+    """Validate and apply a new agent.yaml for an existing agent, then restart it.
+
+    The candidate YAML is validated with the miragen CLI before anything is touched; on
+    validation failure the current config is left untouched. If validation passes but the
+    restart fails, the previous config is restored and the agent is restarted again
+    (best effort). This is the validated alternative to editing agent.yaml directly with
+    miragen_write_agent_file / miragen_edit_agent_file. Returns a diff summary of changed
+    top-level keys, or "ERROR: ...".
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return err
+    d = _agent_dir(agent)
+    yaml_path = d / "agent.yaml"
+    if not d.exists() or not yaml_path.exists():
+        return (
+            f"ERROR: agent '{agent}' not found. Use miragen_list_agents to see available "
+            "agents, or miragen_create_agent to create it."
+        )
+
+    candidate_path = d / "agent.yaml.candidate"
+    candidate_path.write_text(yaml_source)
+
+    result = subprocess.run(
+        ["miragen", "validate", f"agents/{agent}/agent.yaml.candidate"],
+        capture_output=True, text=True, cwd=WORKSPACE,
+    )
+    if result.returncode != 0:
+        candidate_path.unlink(missing_ok=True)
+        return (
+            f"ERROR: validation failed:\n{(result.stdout + result.stderr).strip()}\n\n"
+            "The current config is untouched."
+        )
+
+    profile_name = (yaml.safe_load(yaml_source) or {}).get("name")
+    if profile_name != agent:
+        candidate_path.unlink(missing_ok=True)
+        return (
+            f"ERROR: profile 'name' field is '{profile_name}' but the agent being updated is "
+            f"'{agent}'. They must match — set 'name: {agent}' in the YAML."
+        )
+
+    original_content = yaml_path.read_text()
+    try:
+        old_data = yaml.safe_load(original_content) or {}
+    except Exception:
+        old_data = {}
+    try:
+        new_data = yaml.safe_load(yaml_source) or {}
+    except Exception:
+        new_data = {}
+
+    os.replace(candidate_path, yaml_path)
+
+    restart_result = restart_agent(agent)
+    if restart_result.startswith("ERROR"):
+        yaml_path.write_text(original_content)
+        restart_agent(agent)
+        return (
+            "ERROR: new config applied but restart failed — previous config restored: "
+            f"{restart_result}"
+        )
+
+    changed_keys = sorted(
+        k for k in (set(old_data) | set(new_data)) if old_data.get(k) != new_data.get(k)
+    )
+    summary = ", ".join(changed_keys) if changed_keys else "(no top-level keys changed)"
+    return f"Config updated and {agent} restarted. Diff summary: {summary}"
+
+
+@mcp.tool(
     name="miragen_start_agent",
     annotations=_annotations("Start Agent", idempotent=True),
 )
@@ -848,6 +936,8 @@ def write_agent_file(
 
     Overwrites without warning — use miragen_read_agent_file first, or
     miragen_edit_agent_file for partial changes. Returns "Written <path>" or "ERROR: ...".
+    Writing agent.yaml this way bypasses validation — prefer miragen_update_agent_config
+    for that file.
     """
     err = _check_agent_name(agent)
     if err:
@@ -858,7 +948,10 @@ def write_agent_file(
     try:
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
-        return f"Written {path}"
+        result = f"Written {path}"
+        if path == "agent.yaml":
+            result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
+        return result
     except Exception as exc:
         return f"ERROR: {exc}"
 
@@ -887,7 +980,8 @@ def edit_agent_file(
     container at /agent/<path>.
 
     Fails without modifying anything if old_str is missing or ambiguous.
-    Returns "Edited <path>" or "ERROR: ...".
+    Returns "Edited <path>" or "ERROR: ...". Editing agent.yaml this way bypasses
+    validation — prefer miragen_update_agent_config for that file.
     """
     err = _check_agent_name(agent)
     if err:
@@ -908,7 +1002,10 @@ def edit_agent_file(
     if count > 1:
         return f"ERROR: old_str appears {count} times — must be unique. Include more surrounding context."
     full.write_text(content.replace(old_str, new_str, 1))
-    return f"Edited {path}"
+    result = f"Edited {path}"
+    if path == "agent.yaml":
+        result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
+    return result
 
 
 # ---- Scheduling -------------------------------------------------------------

@@ -459,3 +459,114 @@ def test_edit_tool_restart_failure_reported(tmp_path, monkeypatch):
 
     assert result.startswith("Tool edited but restart failed")
     assert "return 2" in (d / "tools.py").read_text()
+
+
+# ── write_agent_file / edit_agent_file agent.yaml note ────────────────────────
+
+def test_write_agent_file_agent_yaml_adds_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    result = server.write_agent_file("a", "agent.yaml", "name: a\n")
+    assert "miragen_update_agent_config" in result
+
+
+def test_write_agent_file_other_path_no_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    result = server.write_agent_file("a", "notes.txt", "hi")
+    assert "miragen_update_agent_config" not in result
+
+
+def test_edit_agent_file_agent_yaml_adds_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("name: a\nmode: autonomous\n")
+    result = server.edit_agent_file("a", "agent.yaml", "autonomous", "reactive")
+    assert "miragen_update_agent_config" in result
+
+
+# ── update_agent_config ───────────────────────────────────────────────────────
+
+def _fake_run(returncode, output=""):
+    def run(*a, **kw):
+        return type("Result", (), {"returncode": returncode, "stdout": output, "stderr": ""})()
+    return run
+
+
+def test_update_agent_config_agent_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    result = server.update_agent_config("missing", "name: missing\n")
+    assert result.startswith("ERROR:")
+    assert "miragen_list_agents" in result
+    assert "miragen_create_agent" in result
+
+
+def test_update_agent_config_invalid_yaml_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(1, "schema error: bad field"))
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
+    (d / "agent.yaml").write_text(orig_yaml)
+
+    result = server.update_agent_config("a", "name: a\nmode: broken-mode\n")
+
+    assert result.startswith("ERROR: validation failed:")
+    assert "untouched" in result
+    assert (d / "agent.yaml").read_text() == orig_yaml
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+def test_update_agent_config_name_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
+    (d / "agent.yaml").write_text(orig_yaml)
+
+    result = server.update_agent_config("a", "name: b\nmode: autonomous\n")
+
+    assert result.startswith("ERROR:")
+    assert "'a'" in result
+    assert (d / "agent.yaml").read_text() == orig_yaml
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+def test_update_agent_config_restart_failure_restores(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    monkeypatch.setattr(server, "restart_agent", lambda name: "ERROR: container not found")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
+    (d / "agent.yaml").write_text(orig_yaml)
+
+    result = server.update_agent_config("a", "name: a\nmode: reactive\ntools: []\n")
+
+    assert result.startswith("ERROR:")
+    assert "restart failed" in result
+    assert "previous config restored" in result
+    assert (d / "agent.yaml").read_text() == orig_yaml
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+def test_update_agent_config_success_diff_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("name: a\nmode: autonomous\ntools: []\n")
+
+    result = server.update_agent_config("a", "name: a\nmode: reactive\ntools: []\nextra: 1\n")
+
+    assert result.startswith("Config updated and a restarted.")
+    assert "mode" in result
+    assert "extra" in result
+    assert "tools" not in result.split("Diff summary:")[1]
+    assert (d / "agent.yaml").read_text() == "name: a\nmode: reactive\ntools: []\nextra: 1\n"
+    assert not (d / "agent.yaml.candidate").exists()
