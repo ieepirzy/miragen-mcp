@@ -3,10 +3,17 @@ Stubs for heavy deps that have side-effects at import time (docker socket,
 OAuth provider, FastMCP HTTP app). Must be in conftest.py so they are
 installed into sys.modules before server.py is first imported by any test.
 """
+import os
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+# server.py refuses to start when auth is enabled and MCP_CLIENT_SECRET is left at
+# its "changeme" default (see the MCP_ALLOW_DEFAULT_SECRET guard). OAuthProvider is
+# fully mocked below regardless, so the real auth path is never exercised here —
+# opt in to acknowledge the default secret rather than have every test set its own.
+os.environ.setdefault("MCP_ALLOW_DEFAULT_SECRET", "true")
 
 # ── stdlib-only deps that may not be installed in dev ────────────────────────
 
