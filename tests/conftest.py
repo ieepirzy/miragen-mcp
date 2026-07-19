@@ -106,6 +106,8 @@ class _FakeApp:
 
 _fake_mcp = MagicMock()
 _fake_mcp.tool.return_value = _passthrough_decorator
+_fake_mcp.resource.return_value = _passthrough_decorator
+_fake_mcp.prompt.return_value = _passthrough_decorator
 _fake_mcp.http_app.return_value = _FakeApp()
 
 _fastmcp_mod = MagicMock()

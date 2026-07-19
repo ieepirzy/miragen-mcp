@@ -61,6 +61,25 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 
 Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double as Docker container names, and this blocks path traversal), `miragen_register_tool` syntax-checks the submitted source and requires it to define the named `@register` function, and unbounded outputs (logs, file reads, agent responses) are truncated at 50,000 characters.
 
+## Resources & Prompts
+
+Alongside tools, the server exposes read-only **MCP resources** for clients that browse
+context instead of (or in addition to) calling tools, and one **MCP prompt** to bootstrap
+new agents. Unlike tools — which return `"ERROR: ..."` strings — resources raise on
+failure (`ValueError` for an invalid or unknown agent name, `FileNotFoundError` if the
+agent exists but the specific file doesn't), matching FastMCP's convention for resources.
+
+| Resource | MIME type | Description |
+|----------|-----------|--------------|
+| `miragen://agents` | `application/json` | Same data as `miragen_list_agents` |
+| `miragen://agents/{name}/agent.yaml` | `text/yaml` | Raw `agent.yaml` for one agent |
+| `miragen://agents/{name}/tools.py` | `text/x-python` | Raw `tools.py` source for one agent |
+| `miragen://docs/readme` | `text/markdown` | The miragen README, fetched once and cached, with a built-in offline fallback |
+
+| Prompt | Arguments | Description |
+|--------|-----------|--------------|
+| `create-agent` | `purpose` (required), `mode` (default `"autonomous"`) | Walks the model through reading the schema docs, drafting an `agent.yaml`, validating it with `miragen_validate_yaml`, and creating it with `miragen_create_agent` |
+
 ## Requirements
 
 - Docker with the Compose plugin

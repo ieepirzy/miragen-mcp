@@ -1200,6 +1200,151 @@ def validate_yaml(
         tmp.unlink(missing_ok=True)
 
 
+# ---- Resources ---------------------------------------------------------------
+# Read-only counterparts to the tools above, for clients that browse MCP
+# resources instead of (or alongside) calling tools. Unlike tools, which
+# return "ERROR: ..." strings, resources raise on failure -- that's FastMCP's
+# convention for resources and lets clients get a proper protocol-level error.
+
+# Cache the README after the first successful fetch so repeat resource reads
+# don't re-hit the network; a failed fetch is not cached so it can succeed
+# later without a server restart.
+_readme_cache: str | None = None
+
+_README_FALLBACK = """# miragen (offline schema summary)
+
+Could not fetch the full README from GitHub. Minimal agent.yaml schema:
+
+    name: <lowercase-hyphenated-name>   # must match the agent's directory/container name
+    mode: autonomous | reactive
+    spec:
+      model: <provider/model>
+      instructions: |
+        <what the agent should do>
+    tools: []                          # names registered via miragen_register_tool
+
+Validate any draft with miragen_validate_yaml before miragen_create_agent.
+"""
+
+
+@mcp.resource(
+    "miragen://agents",
+    name="Agents",
+    description="JSON list of every miragen agent in the workspace (same data as miragen_list_agents).",
+    mime_type="application/json",
+)
+def agents_resource() -> dict:
+    """Expose the agent list as a browsable resource. Mirrors miragen_list_agents."""
+    return list_agents()
+
+
+@mcp.resource(
+    "miragen://agents/{name}/agent.yaml",
+    name="Agent Profile",
+    description="Raw agent.yaml contents for one agent.",
+    mime_type="text/yaml",
+)
+def agent_yaml_resource(name: AgentName) -> str:
+    """Raw agent.yaml text for `name` (same bytes as miragen_read_agent_file for that path).
+
+    Raises ValueError if `name` is invalid or no such agent exists, FileNotFoundError if
+    the agent exists but has no agent.yaml.
+    """
+    err = _check_agent_name(name)
+    if err:
+        raise ValueError(err)
+    if not _agent_dir(name).exists():
+        raise ValueError(f"agent '{name}' not found. Read miragen://agents to see existing agents.")
+    full, path_err = _safe_path(name, "agent.yaml")
+    if path_err:
+        raise ValueError(path_err)
+    if not full.exists():
+        raise FileNotFoundError(f"agent.yaml not found for agent '{name}'.")
+    return full.read_text()
+
+
+@mcp.resource(
+    "miragen://agents/{name}/tools.py",
+    name="Agent Tools Source",
+    description="Raw tools.py contents for one agent.",
+    mime_type="text/x-python",
+)
+def agent_tools_resource(name: AgentName) -> str:
+    """Raw tools.py text for `name` (same bytes as miragen_read_agent_file for that path).
+
+    Same error conventions as the agent.yaml resource above.
+    """
+    err = _check_agent_name(name)
+    if err:
+        raise ValueError(err)
+    if not _agent_dir(name).exists():
+        raise ValueError(f"agent '{name}' not found. Read miragen://agents to see existing agents.")
+    full, path_err = _safe_path(name, "tools.py")
+    if path_err:
+        raise ValueError(path_err)
+    if not full.exists():
+        raise FileNotFoundError(f"tools.py not found for agent '{name}'.")
+    return full.read_text()
+
+
+@mcp.resource(
+    "miragen://docs/readme",
+    name="Miragen Docs",
+    description="The miragen agent profile README, fetched once and cached (offline fallback included).",
+    mime_type="text/markdown",
+)
+def readme_resource() -> str:
+    """Serve the miragen README (same source as miragen_get_readme), cached after the first
+    successful fetch. Falls back to a short built-in schema summary if the MCP server has
+    no network access -- this never blocks or retries indefinitely.
+    """
+    global _readme_cache
+    if _readme_cache is not None:
+        return _readme_cache
+    fetched = get_miragen_readme()
+    if fetched.startswith("ERROR"):
+        return _README_FALLBACK
+    _readme_cache = fetched
+    return _readme_cache
+
+
+# ---- Prompts ------------------------------------------------------------------
+
+
+@mcp.prompt(name="create-agent")
+def create_agent_prompt(
+    purpose: Annotated[str, Field(description="What the new agent should do, in plain language.")],
+    mode: Annotated[
+        str,
+        Field(description="Agent mode: 'autonomous' (runs on its own) or 'reactive' (only responds when prompted)."),
+    ] = "autonomous",
+) -> str:
+    """Guide the model through drafting, validating, and creating a new miragen agent."""
+    return f"""Create a new miragen agent.
+
+Purpose: {purpose}
+Mode: {mode}
+
+1. Read miragen://docs/readme (or call miragen_get_readme) for the full agent.yaml schema:
+   fields, supported modes, triggers, capabilities, and the approval flow.
+2. Draft an agent.yaml profile for this purpose and mode, starting from this skeleton:
+
+   name: <lowercase-hyphenated-name>
+   mode: {mode}
+   spec:
+     model: <provider/model>
+     instructions: |
+       <what this agent should do and how>
+   tools: []
+
+3. Call miragen_validate_yaml with the draft. If it reports errors, fix the YAML and
+   validate again -- repeat until it passes.
+4. Call miragen_create_agent with the chosen agent name and the validated YAML.
+5. Check miragen_get_agent_logs to confirm it started; use miragen_register_tool next if
+   this agent needs custom tools.
+"""
+
+
 # ---------------------------------------------------------------------------
 # App assembly
 # ---------------------------------------------------------------------------
