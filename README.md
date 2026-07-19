@@ -56,8 +56,16 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_edit_agent_file` | **destructive** | String-replace edit a file in agent workspace |
 | `miragen_run_agent` | open-world | Send a prompt to agent's `/run` endpoint |
 | `miragen_set_retrigger` | open-world | Schedule a one-shot prompt (delay or absolute time) |
+| `miragen_list_runs` | read-only | List an agent's run records, newest first (optional status filter) |
+| `miragen_get_run` | read-only | Full durable record for one run (status, usage, provenance, handles) |
+| `miragen_get_run_events` | read-only | Run event stream: tail read or cursor replay (`after`/`limit`) |
+| `miragen_get_run_diff` | read-only | Harvested workspace diff of a succeeded executor run |
+| `miragen_resume_run` | open-world | Give a suspended/failed executor run another turn |
+| `miragen_abandon_run` | **destructive** | Human-terminal abandon; optional workspace discard |
+| `miragen_check_deployment` | read-only | Deployed miragen version/capabilities vs what this server supports |
 | `miragen_validate_yaml` | read-only | Validate agent YAML using miragen CLI |
 | `miragen_get_readme` | read-only | Fetch latest Miragen README from GitHub |
+| `miragen_get_doc` | read-only | Fetch a linked secondary doc (`docs/**.md`) from the miragen repo |
 
 Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double as Docker container names, and this blocks path traversal), `miragen_register_tool` syntax-checks the submitted source and requires it to define the named `@register` function, and unbounded outputs (logs, file reads, agent responses) are truncated at 50,000 characters.
 
@@ -162,6 +170,7 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 |----------|---------|-------------|
 | `MIRAGEN_WORKSPACE` | `/opt/miragen` | Root workspace directory on the host |
 | `MIRAGEN_BASE_IMAGE` | `ghcr.io/ieepirzy/miragen:latest` | Docker image used for new agent containers |
+| `MIRAGEN_INTERNAL_TOKEN` | *(empty)* | Sent as `X-Miragen-Token` on calls to the agents' HTTP control APIs — set it to the same value the agent containers use, if they enforce one |
 | `MCP_BASE_URL` | *(required)* | Public base URL of this server — used for OAuth |
 | `MCP_CLIENT_ID` | `miragen-mcp` | OAuth client ID |
 | `MCP_CLIENT_SECRET` | `changeme` | OAuth client secret — **must be set explicitly if auth is enabled** |
