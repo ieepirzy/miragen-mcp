@@ -490,12 +490,16 @@ def update_agent_config(
 
     original_content = yaml_path.read_text()
     try:
-        old_data = yaml.safe_load(original_content) or {}
+        old_data = yaml.safe_load(original_content)
     except Exception:
         old_data = {}
+    if not isinstance(old_data, dict):
+        old_data = {}
     try:
-        new_data = yaml.safe_load(yaml_source) or {}
+        new_data = yaml.safe_load(yaml_source)
     except Exception:
+        new_data = {}
+    if not isinstance(new_data, dict):
         new_data = {}
 
     os.replace(candidate_path, yaml_path)
@@ -1216,7 +1220,7 @@ _README_FALLBACK = """# miragen (offline schema summary)
 Could not fetch the full README from GitHub. Minimal agent.yaml schema:
 
     name: <lowercase-hyphenated-name>   # must match the agent's directory/container name
-    mode: autonomous | reactive
+    mode: autonomous | interactive | hybrid
     spec:
       model: <provider/model>
       instructions: |
@@ -1316,7 +1320,12 @@ def create_agent_prompt(
     purpose: Annotated[str, Field(description="What the new agent should do, in plain language.")],
     mode: Annotated[
         str,
-        Field(description="Agent mode: 'autonomous' (runs on its own) or 'reactive' (only responds when prompted)."),
+        Field(
+            description=(
+                "Agent mode: 'autonomous' (runs on its own), 'interactive' (only responds "
+                "when prompted), or 'hybrid'."
+            )
+        ),
     ] = "autonomous",
 ) -> str:
     """Guide the model through drafting, validating, and creating a new miragen agent."""

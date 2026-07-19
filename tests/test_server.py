@@ -554,6 +554,23 @@ def test_update_agent_config_restart_failure_restores(tmp_path, monkeypatch):
     assert not (d / "agent.yaml.candidate").exists()
 
 
+def test_update_agent_config_non_dict_live_yaml_diffs_cleanly(tmp_path, monkeypatch):
+    """A malformed live agent.yaml (valid YAML, not a mapping -- e.g. left behind by the
+    raw file-write tools this update flow exists to recover from) must not crash the diff
+    calculation after the candidate has already replaced it and the agent restarted."""
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("- not\n- a\n- mapping\n")
+
+    result = server.update_agent_config("a", "name: a\nmode: autonomous\ntools: []\n")
+
+    assert result.startswith("Config updated and a restarted.")
+    assert (d / "agent.yaml").read_text() == "name: a\nmode: autonomous\ntools: []\n"
+
+
 def test_update_agent_config_success_diff_summary(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
     monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
