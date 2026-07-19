@@ -128,8 +128,13 @@ docker run -d \
 
 ```bash
 pip install -r requirements.txt
-MCP_BASE_URL=http://localhost:8000 uvicorn server:app --host 0.0.0.0 --port 8000
+MCP_BASE_URL=http://localhost:8000 MCP_NO_AUTH=true uvicorn server:app --host 0.0.0.0 --port 8000
 ```
+
+`MCP_NO_AUTH=true` skips OAuth entirely, which is the simplest way to run locally
+without provisioning a client secret. If you'd rather exercise the OAuth flow
+locally, set a real `MCP_CLIENT_SECRET` instead — the server refuses to start with
+auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authentication)).
 
 ## Configuration
 
@@ -139,7 +144,9 @@ MCP_BASE_URL=http://localhost:8000 uvicorn server:app --host 0.0.0.0 --port 8000
 | `MIRAGEN_BASE_IMAGE` | `ghcr.io/ieepirzy/miragen:latest` | Docker image used for new agent containers |
 | `MCP_BASE_URL` | *(required)* | Public base URL of this server — used for OAuth |
 | `MCP_CLIENT_ID` | `miragen-mcp` | OAuth client ID |
-| `MCP_CLIENT_SECRET` | `changeme` | OAuth client secret — **change in production** |
+| `MCP_CLIENT_SECRET` | `changeme` | OAuth client secret — **must be set explicitly if auth is enabled** |
+| `MCP_NO_AUTH` | `false` | Disable OAuth entirely (local development only) |
+| `MCP_ALLOW_DEFAULT_SECRET` | `false` | Explicitly acknowledge and allow starting with the default `changeme` secret while auth is enabled (not recommended) |
 
 **LLM provider keys** (pass at least one):
 
@@ -175,6 +182,8 @@ Agent workspace directories are mounted to `/agent` inside each container, so fi
 ## Authentication
 
 The server is protected with OAuth2 via the [Origo](https://github.com/ieepirzy/origo) library. Tokens are valid for 7 days. Configure your MCP client with the client credentials defined by `MCP_CLIENT_ID` and `MCP_CLIENT_SECRET`.
+
+If `MCP_NO_AUTH` is not `true`, the server refuses to start when `MCP_CLIENT_SECRET` is left unset (defaulting to the well-known value `changeme`) — this server holds the Docker socket, so booting with a publicly-known OAuth secret is a full compromise waiting to happen. Set a real `MCP_CLIENT_SECRET`, set `MCP_NO_AUTH=true` for auth-free local development, or set `MCP_ALLOW_DEFAULT_SECRET=true` to explicitly acknowledge the risk and start anyway (not recommended outside of throwaway testing).
 
 ## Development
 

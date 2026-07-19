@@ -358,3 +358,104 @@ def test_delete_tool_not_found(tmp_path, monkeypatch):
     (d / "tools.py").write_text("from miragen import register\n")
     result = server.delete_tool("a", "ghost")
     assert result.startswith("ERROR:")
+
+
+# ── edit_tool ─────────────────────────────────────────────────────────────────
+
+def test_edit_tool_tool_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    original = "from miragen import register\n\n@register\nasync def keeper(ctx):\n    return 1\n"
+    (d / "tools.py").write_text(original)
+
+    result = server.edit_tool("a", "ghost", "return 1", "return 2")
+
+    assert result.startswith("ERROR:")
+    assert "not found" in result
+    assert (d / "tools.py").read_text() == original
+
+
+def test_edit_tool_old_str_outside_named_span(tmp_path, monkeypatch):
+    """old_str is unique in the whole file but lives inside a *different*
+    function than the one named by tool_name — must not edit the wrong tool."""
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    original = (
+        "from miragen import register\n\n"
+        "@register\nasync def alpha(ctx):\n    return 'alpha-marker'\n\n"
+        "@register\nasync def beta(ctx):\n    return 'beta-marker'\n"
+    )
+    (d / "tools.py").write_text(original)
+
+    result = server.edit_tool("a", "beta", "alpha-marker", "hacked")
+
+    assert result.startswith("ERROR:")
+    assert (d / "tools.py").read_text() == original
+
+
+def test_edit_tool_no_match_within_span(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    original = "from miragen import register\n\n@register\nasync def solo(ctx):\n    return 1\n"
+    (d / "tools.py").write_text(original)
+
+    result = server.edit_tool("a", "solo", "nope", "x")
+
+    assert result.startswith("ERROR:")
+    assert (d / "tools.py").read_text() == original
+
+
+def test_edit_tool_ambiguous_within_span(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    original = (
+        "from miragen import register\n\n"
+        "@register\nasync def dup(ctx):\n    x = 1\n    x = 1\n    return x\n"
+    )
+    (d / "tools.py").write_text(original)
+
+    result = server.edit_tool("a", "dup", "x = 1", "x = 2")
+
+    assert result.startswith("ERROR:")
+    assert "2 times" in result
+    assert (d / "tools.py").read_text() == original
+
+
+def test_edit_tool_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "tools.py").write_text(
+        "from miragen import register\n\n"
+        "@register\nasync def alpha(ctx):\n    return 'alpha-marker'\n\n"
+        "@register\nasync def beta(ctx):\n    return 'beta-marker'\n"
+    )
+
+    result = server.edit_tool("a", "beta", "beta-marker", "beta-updated")
+
+    assert result.startswith("Tool 'beta' edited")
+    assert "restarted" in result
+    src = (d / "tools.py").read_text()
+    assert "beta-updated" in src
+    assert "beta-marker" not in src
+    assert "alpha-marker" in src  # other function untouched
+
+
+def test_edit_tool_restart_failure_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "restart_agent", lambda name: "ERROR: container not found")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "tools.py").write_text(
+        "from miragen import register\n\n@register\nasync def solo(ctx):\n    return 1\n"
+    )
+
+    result = server.edit_tool("a", "solo", "return 1", "return 2")
+
+    assert result.startswith("Tool edited but restart failed")
+    assert "return 2" in (d / "tools.py").read_text()

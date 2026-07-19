@@ -717,20 +717,21 @@ def edit_tool(
         str,
         Field(
             description=(
-                "Exact text to replace in tools.py — must appear exactly once in the whole file. "
-                "Copy it from miragen_get_tool_source; include enough surrounding lines to make "
-                "it unique."
+                "Exact text to replace — must appear exactly once within tool_name's function "
+                "body (decorator through end of function). Copy it from miragen_get_tool_source; "
+                "include enough surrounding lines to make it unique."
             ),
             min_length=1,
         ),
     ],
     new_str: Annotated[str, Field(description="Replacement text.")],
 ) -> str:
-    """Edit an agent's tools.py via exact string replacement, then restart the agent.
+    """Edit one tool in an agent's tools.py via exact string replacement scoped to that
+    tool's function, then restart the agent.
 
     Call miragen_get_tool_source first to get the exact current text. Fails without
-    modifying anything if old_str is missing or ambiguous. Returns a success message
-    or "ERROR: ...".
+    modifying anything if tool_name doesn't exist, or old_str is missing or ambiguous
+    within that tool's function body. Returns a success message or "ERROR: ...".
     """
     err = _check_agent_name(agent)
     if err:
@@ -738,16 +739,29 @@ def edit_tool(
     tools_path = _agent_dir(agent) / "tools.py"
     if not tools_path.exists():
         return f"ERROR: tools.py not found for agent '{agent}'. Use miragen_list_agents to see available agents."
-    content = tools_path.read_text()
-    count = content.count(old_str)
+
+    source = tools_path.read_text()
+    span = _find_function_span(source, tool_name)
+    if span is None:
+        return f"ERROR: tool '{tool_name}' not found. Use miragen_list_tools to see registered tools."
+
+    lines = source.splitlines(keepends=True)
+    before = "".join(lines[: span[0]])
+    target = "".join(lines[span[0] : span[1]])
+    after = "".join(lines[span[1] :])
+
+    count = target.count(old_str)
     if count == 0:
         return (
-            "ERROR: old_str not found in tools.py. Use miragen_get_tool_source to fetch the "
-            "current source and copy old_str from it exactly."
+            f"ERROR: old_str not found within tool '{tool_name}'. Use miragen_get_tool_source to "
+            "fetch its current source and copy old_str from it exactly."
         )
     if count > 1:
-        return f"ERROR: old_str appears {count} times — must be unique. Include more surrounding context."
-    tools_path.write_text(content.replace(old_str, new_str, 1))
+        return (
+            f"ERROR: old_str appears {count} times within tool '{tool_name}' — must be unique. "
+            "Include more surrounding context."
+        )
+    tools_path.write_text(before + target.replace(old_str, new_str, 1) + after)
     result = restart_agent(agent)
     if result.startswith("ERROR"):
         return f"Tool edited but restart failed: {result}"
@@ -1097,6 +1111,23 @@ def validate_yaml(
 app = mcp.http_app(stateless_http=True, path=MCP_PATH)
 
 if not NO_AUTH:
+    if CLIENT_SECRET == "changeme":
+        if os.getenv("MCP_ALLOW_DEFAULT_SECRET", "false").lower() != "true":
+            raise RuntimeError(
+                "MCP_CLIENT_SECRET is unset and defaulting to the well-known value 'changeme' "
+                "while auth is enabled (MCP_NO_AUTH is not 'true'). This server holds the "
+                "Docker socket -- starting with a publicly-known OAuth client secret is a full "
+                "compromise waiting to happen. Set MCP_CLIENT_SECRET to a real secret, set "
+                "MCP_NO_AUTH=true for local development without auth, or set "
+                "MCP_ALLOW_DEFAULT_SECRET=true to acknowledge the risk and start anyway."
+            )
+        logger.warning(
+            "MCP_CLIENT_SECRET is unset and defaulting to the well-known value 'changeme' "
+            "while auth is enabled. This is INSECURE -- proceeding only because "
+            "MCP_ALLOW_DEFAULT_SECRET=true was set. Set a real MCP_CLIENT_SECRET as soon as "
+            "possible."
+        )
+
     auth = OAuthProvider(
         base_url=BASE_URL,
         clients={CLIENT_ID: CLIENT_SECRET},
