@@ -459,3 +459,319 @@ def test_edit_tool_restart_failure_reported(tmp_path, monkeypatch):
 
     assert result.startswith("Tool edited but restart failed")
     assert "return 2" in (d / "tools.py").read_text()
+
+
+# ── write_agent_file / edit_agent_file agent.yaml note ────────────────────────
+
+def test_write_agent_file_agent_yaml_adds_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    result = server.write_agent_file("a", "agent.yaml", "name: a\n")
+    assert "miragen_update_agent_config" in result
+
+
+def test_write_agent_file_other_path_no_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    result = server.write_agent_file("a", "notes.txt", "hi")
+    assert "miragen_update_agent_config" not in result
+
+
+def test_edit_agent_file_agent_yaml_adds_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("name: a\nmode: autonomous\n")
+    result = server.edit_agent_file("a", "agent.yaml", "autonomous", "reactive")
+    assert "miragen_update_agent_config" in result
+
+
+# ── update_agent_config ───────────────────────────────────────────────────────
+
+def _fake_run(returncode, output=""):
+    def run(*a, **kw):
+        return type("Result", (), {"returncode": returncode, "stdout": output, "stderr": ""})()
+    return run
+
+
+def test_update_agent_config_agent_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    result = server.update_agent_config("missing", "name: missing\n")
+    assert result.startswith("ERROR:")
+    assert "miragen_list_agents" in result
+    assert "miragen_create_agent" in result
+
+
+def test_update_agent_config_invalid_yaml_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(1, "schema error: bad field"))
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
+    (d / "agent.yaml").write_text(orig_yaml)
+
+    result = server.update_agent_config("a", "name: a\nmode: broken-mode\n")
+
+    assert result.startswith("ERROR: validation failed:")
+    assert "untouched" in result
+    assert (d / "agent.yaml").read_text() == orig_yaml
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+def test_update_agent_config_name_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
+    (d / "agent.yaml").write_text(orig_yaml)
+
+    result = server.update_agent_config("a", "name: b\nmode: autonomous\n")
+
+    assert result.startswith("ERROR:")
+    assert "'a'" in result
+    assert (d / "agent.yaml").read_text() == orig_yaml
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+def test_update_agent_config_restart_failure_restores(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    monkeypatch.setattr(server, "restart_agent", lambda name: "ERROR: container not found")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
+    (d / "agent.yaml").write_text(orig_yaml)
+
+    result = server.update_agent_config("a", "name: a\nmode: reactive\ntools: []\n")
+
+    assert result.startswith("ERROR:")
+    assert "restart failed" in result
+    assert "previous config restored" in result
+    assert (d / "agent.yaml").read_text() == orig_yaml
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+def test_update_agent_config_non_dict_live_yaml_diffs_cleanly(tmp_path, monkeypatch):
+    """A malformed live agent.yaml (valid YAML, not a mapping -- e.g. left behind by the
+    raw file-write tools this update flow exists to recover from) must not crash the diff
+    calculation after the candidate has already replaced it and the agent restarted."""
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("- not\n- a\n- mapping\n")
+
+    result = server.update_agent_config("a", "name: a\nmode: autonomous\ntools: []\n")
+
+    assert result.startswith("Config updated and a restarted.")
+    assert (d / "agent.yaml").read_text() == "name: a\nmode: autonomous\ntools: []\n"
+
+
+def test_update_agent_config_success_diff_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
+    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("name: a\nmode: autonomous\ntools: []\n")
+
+    result = server.update_agent_config("a", "name: a\nmode: reactive\ntools: []\nextra: 1\n")
+
+    assert result.startswith("Config updated and a restarted.")
+    assert "mode" in result
+    assert "extra" in result
+    assert "tools" not in result.split("Diff summary:")[1]
+    assert (d / "agent.yaml").read_text() == "name: a\nmode: reactive\ntools: []\nextra: 1\n"
+    assert not (d / "agent.yaml.candidate").exists()
+
+
+# ── resources: miragen://agents ───────────────────────────────────────────────
+
+def test_agents_resource_matches_list_agents(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("name: a\nmode: autonomous\nspec:\n  model: anthropic/claude\n")
+    assert server.agents_resource() == server.list_agents()
+
+
+# ── resources: miragen://agents/{name}/agent.yaml ─────────────────────────────
+
+def test_agent_yaml_resource_matches_file_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text("name: a\nmode: autonomous\n")
+    assert server.agent_yaml_resource("a") == server.read_agent_file("a", "agent.yaml")
+    assert server.agent_yaml_resource("a") == server.get_agent("a")["yaml"]
+
+
+def test_agent_yaml_resource_invalid_name_raises():
+    with pytest.raises(ValueError):
+        server.agent_yaml_resource("../escape")
+
+
+def test_agent_yaml_resource_missing_agent_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    with pytest.raises(ValueError):
+        server.agent_yaml_resource("ghost")
+
+
+def test_agent_yaml_resource_missing_file_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents" / "a").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError):
+        server.agent_yaml_resource("a")
+
+
+# ── resources: miragen://agents/{name}/tools.py ───────────────────────────────
+
+def test_agent_tools_resource_matches_file_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    d = tmp_path / "agents" / "a"
+    d.mkdir(parents=True)
+    (d / "tools.py").write_text("from miragen import register\n\n# Tools for a\n")
+    assert server.agent_tools_resource("a") == server.read_agent_file("a", "tools.py")
+
+
+def test_agent_tools_resource_invalid_name_raises():
+    with pytest.raises(ValueError):
+        server.agent_tools_resource("Bad Name")
+
+
+def test_agent_tools_resource_missing_agent_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    with pytest.raises(ValueError):
+        server.agent_tools_resource("ghost")
+
+
+def test_agent_tools_resource_missing_file_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents" / "a").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError):
+        server.agent_tools_resource("a")
+
+
+# ── resource: miragen://docs/readme ───────────────────────────────────────────
+
+def test_readme_resource_returns_fetched_content(monkeypatch):
+    monkeypatch.setattr(server, "_readme_cache", None)
+    monkeypatch.setattr(server, "get_miragen_readme", lambda: "# Miragen\nfetched content")
+    assert server.readme_resource() == "# Miragen\nfetched content"
+
+
+def test_readme_resource_caches_after_success(monkeypatch):
+    monkeypatch.setattr(server, "_readme_cache", None)
+    calls = {"n": 0}
+
+    def fake_fetch():
+        calls["n"] += 1
+        return f"content #{calls['n']}"
+
+    monkeypatch.setattr(server, "get_miragen_readme", fake_fetch)
+    first = server.readme_resource()
+    second = server.readme_resource()
+    assert first == second == "content #1"
+    assert calls["n"] == 1
+
+
+def test_readme_resource_falls_back_when_fetch_fails(monkeypatch):
+    monkeypatch.setattr(server, "_readme_cache", None)
+    monkeypatch.setattr(server, "get_miragen_readme", lambda: "ERROR: could not fetch README: timeout")
+    result = server.readme_resource()
+    assert result == server._README_FALLBACK
+    assert "agent.yaml" in result
+
+
+def test_readme_resource_retries_after_failure(monkeypatch):
+    monkeypatch.setattr(server, "_readme_cache", None)
+    calls = {"n": 0}
+
+    def flaky_fetch():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "ERROR: no network"
+        return "fetched on retry"
+
+    monkeypatch.setattr(server, "get_miragen_readme", flaky_fetch)
+    assert server.readme_resource() == server._README_FALLBACK
+    assert server.readme_resource() == "fetched on retry"
+
+
+# ── prompt: create-agent ──────────────────────────────────────────────────────
+
+def test_create_agent_prompt_default_mode():
+    result = server.create_agent_prompt("send a daily weather summary")
+    assert "send a daily weather summary" in result
+    assert "autonomous" in result
+
+
+def test_create_agent_prompt_explicit_mode():
+    result = server.create_agent_prompt("watch a webhook", mode="reactive")
+    assert "watch a webhook" in result
+    assert "reactive" in result
+
+
+def test_create_agent_prompt_references_real_tools():
+    result = server.create_agent_prompt("do something")
+    for tool_name in (
+        "miragen_get_readme",
+        "miragen_validate_yaml",
+        "miragen_create_agent",
+        "miragen_get_agent_logs",
+        "miragen_register_tool",
+    ):
+        assert tool_name in result
+
+
+# ── real fastmcp end-to-end sanity (skipped if fastmcp isn't installed) ──────
+
+def test_resource_and_prompt_decorators_accept_real_fastmcp_kwargs():
+    """server.py calls mcp.resource(...)/mcp.prompt(...) with specific kwargs (mime_type,
+    name, description, uri templates with {param}). conftest fakes these as passthroughs
+    for unit testing, so this checks the real library actually accepts that call shape.
+
+    conftest.py unconditionally installs MagicMocks at sys.modules["fastmcp"] and
+    sys.modules["starlette*"] (server.py must import successfully even where the real
+    packages aren't installed), so a plain `pytest.importorskip("fastmcp")` would just find
+    the stub and never exercise the real library. Check the real distribution via
+    importlib.metadata instead, and swap the stubs out of sys.modules -- fastmcp pulls in
+    starlette transitively -- for the duration of this one test.
+    """
+    import importlib
+    import importlib.metadata
+    import sys
+
+    try:
+        importlib.metadata.version("fastmcp")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("real fastmcp package is not installed (only the conftest stub is present)")
+
+    def _is_stubbed_dep(n: str) -> bool:
+        return n == "fastmcp" or n.startswith(("fastmcp.", "starlette", "mcp", "uvicorn"))
+
+    saved = {n: sys.modules.pop(n) for n in list(sys.modules) if _is_stubbed_dep(n)}
+    try:
+        real_fastmcp = importlib.import_module("fastmcp")
+        real_mcp = real_fastmcp.FastMCP("test-server")
+
+        template = real_mcp.resource(
+            "miragen://agents/{name}/agent.yaml",
+            name="Agent Profile",
+            description="Raw agent.yaml contents for one agent.",
+            mime_type="text/yaml",
+        )(lambda name: f"name: {name}\n")
+        assert template.name == "Agent Profile"
+
+        prompt = real_mcp.prompt(name="create-agent")(
+            lambda purpose, mode="autonomous": f"{purpose} {mode}"
+        )
+        assert prompt.name == "create-agent"
+    finally:
+        for n in [n for n in sys.modules if _is_stubbed_dep(n)]:
+            del sys.modules[n]
+        sys.modules.update(saved)

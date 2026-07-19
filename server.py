@@ -429,6 +429,98 @@ def create_agent(
 
 
 @mcp.tool(
+    name="miragen_update_agent_config",
+    annotations=_annotations("Update Agent Config", destructive=True, idempotent=True),
+)
+def update_agent_config(
+    agent: AgentName,
+    yaml_source: Annotated[
+        str,
+        Field(
+            description=(
+                "Complete replacement agent.yaml content. Fetch the current version with "
+                "miragen_get_agent first and edit it — this replaces the whole file. Must "
+                "keep 'name: <agent>'."
+            ),
+            min_length=1,
+        ),
+    ],
+) -> str:
+    """Validate and apply a new agent.yaml for an existing agent, then restart it.
+
+    The candidate YAML is validated with the miragen CLI before anything is touched; on
+    validation failure the current config is left untouched. If validation passes but the
+    restart fails, the previous config is restored and the agent is restarted again
+    (best effort). This is the validated alternative to editing agent.yaml directly with
+    miragen_write_agent_file / miragen_edit_agent_file. Returns a diff summary of changed
+    top-level keys, or "ERROR: ...".
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return err
+    d = _agent_dir(agent)
+    yaml_path = d / "agent.yaml"
+    if not d.exists() or not yaml_path.exists():
+        return (
+            f"ERROR: agent '{agent}' not found. Use miragen_list_agents to see available "
+            "agents, or miragen_create_agent to create it."
+        )
+
+    candidate_path = d / "agent.yaml.candidate"
+    candidate_path.write_text(yaml_source)
+
+    result = subprocess.run(
+        ["miragen", "validate", f"agents/{agent}/agent.yaml.candidate"],
+        capture_output=True, text=True, cwd=WORKSPACE,
+    )
+    if result.returncode != 0:
+        candidate_path.unlink(missing_ok=True)
+        return (
+            f"ERROR: validation failed:\n{(result.stdout + result.stderr).strip()}\n\n"
+            "The current config is untouched."
+        )
+
+    profile_name = (yaml.safe_load(yaml_source) or {}).get("name")
+    if profile_name != agent:
+        candidate_path.unlink(missing_ok=True)
+        return (
+            f"ERROR: profile 'name' field is '{profile_name}' but the agent being updated is "
+            f"'{agent}'. They must match — set 'name: {agent}' in the YAML."
+        )
+
+    original_content = yaml_path.read_text()
+    try:
+        old_data = yaml.safe_load(original_content)
+    except Exception:
+        old_data = {}
+    if not isinstance(old_data, dict):
+        old_data = {}
+    try:
+        new_data = yaml.safe_load(yaml_source)
+    except Exception:
+        new_data = {}
+    if not isinstance(new_data, dict):
+        new_data = {}
+
+    os.replace(candidate_path, yaml_path)
+
+    restart_result = restart_agent(agent)
+    if restart_result.startswith("ERROR"):
+        yaml_path.write_text(original_content)
+        restart_agent(agent)
+        return (
+            "ERROR: new config applied but restart failed — previous config restored: "
+            f"{restart_result}"
+        )
+
+    changed_keys = sorted(
+        k for k in (set(old_data) | set(new_data)) if old_data.get(k) != new_data.get(k)
+    )
+    summary = ", ".join(changed_keys) if changed_keys else "(no top-level keys changed)"
+    return f"Config updated and {agent} restarted. Diff summary: {summary}"
+
+
+@mcp.tool(
     name="miragen_start_agent",
     annotations=_annotations("Start Agent", idempotent=True),
 )
@@ -848,6 +940,8 @@ def write_agent_file(
 
     Overwrites without warning — use miragen_read_agent_file first, or
     miragen_edit_agent_file for partial changes. Returns "Written <path>" or "ERROR: ...".
+    Writing agent.yaml this way bypasses validation — prefer miragen_update_agent_config
+    for that file.
     """
     err = _check_agent_name(agent)
     if err:
@@ -858,7 +952,10 @@ def write_agent_file(
     try:
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
-        return f"Written {path}"
+        result = f"Written {path}"
+        if path == "agent.yaml":
+            result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
+        return result
     except Exception as exc:
         return f"ERROR: {exc}"
 
@@ -887,7 +984,8 @@ def edit_agent_file(
     container at /agent/<path>.
 
     Fails without modifying anything if old_str is missing or ambiguous.
-    Returns "Edited <path>" or "ERROR: ...".
+    Returns "Edited <path>" or "ERROR: ...". Editing agent.yaml this way bypasses
+    validation — prefer miragen_update_agent_config for that file.
     """
     err = _check_agent_name(agent)
     if err:
@@ -908,7 +1006,10 @@ def edit_agent_file(
     if count > 1:
         return f"ERROR: old_str appears {count} times — must be unique. Include more surrounding context."
     full.write_text(content.replace(old_str, new_str, 1))
-    return f"Edited {path}"
+    result = f"Edited {path}"
+    if path == "agent.yaml":
+        result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
+    return result
 
 
 # ---- Scheduling -------------------------------------------------------------
@@ -1101,6 +1202,156 @@ def validate_yaml(
         return (result.stdout + result.stderr).strip() or "OK"
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ---- Resources ---------------------------------------------------------------
+# Read-only counterparts to the tools above, for clients that browse MCP
+# resources instead of (or alongside) calling tools. Unlike tools, which
+# return "ERROR: ..." strings, resources raise on failure -- that's FastMCP's
+# convention for resources and lets clients get a proper protocol-level error.
+
+# Cache the README after the first successful fetch so repeat resource reads
+# don't re-hit the network; a failed fetch is not cached so it can succeed
+# later without a server restart.
+_readme_cache: str | None = None
+
+_README_FALLBACK = """# miragen (offline schema summary)
+
+Could not fetch the full README from GitHub. Minimal agent.yaml schema:
+
+    name: <lowercase-hyphenated-name>   # must match the agent's directory/container name
+    mode: autonomous | interactive | hybrid
+    spec:
+      model: <provider/model>
+      instructions: |
+        <what the agent should do>
+    tools: []                          # names registered via miragen_register_tool
+
+Validate any draft with miragen_validate_yaml before miragen_create_agent.
+"""
+
+
+@mcp.resource(
+    "miragen://agents",
+    name="Agents",
+    description="JSON list of every miragen agent in the workspace (same data as miragen_list_agents).",
+    mime_type="application/json",
+)
+def agents_resource() -> dict:
+    """Expose the agent list as a browsable resource. Mirrors miragen_list_agents."""
+    return list_agents()
+
+
+@mcp.resource(
+    "miragen://agents/{name}/agent.yaml",
+    name="Agent Profile",
+    description="Raw agent.yaml contents for one agent.",
+    mime_type="text/yaml",
+)
+def agent_yaml_resource(name: AgentName) -> str:
+    """Raw agent.yaml text for `name` (same bytes as miragen_read_agent_file for that path).
+
+    Raises ValueError if `name` is invalid or no such agent exists, FileNotFoundError if
+    the agent exists but has no agent.yaml.
+    """
+    err = _check_agent_name(name)
+    if err:
+        raise ValueError(err)
+    if not _agent_dir(name).exists():
+        raise ValueError(f"agent '{name}' not found. Read miragen://agents to see existing agents.")
+    full, path_err = _safe_path(name, "agent.yaml")
+    if path_err:
+        raise ValueError(path_err)
+    if not full.exists():
+        raise FileNotFoundError(f"agent.yaml not found for agent '{name}'.")
+    return full.read_text()
+
+
+@mcp.resource(
+    "miragen://agents/{name}/tools.py",
+    name="Agent Tools Source",
+    description="Raw tools.py contents for one agent.",
+    mime_type="text/x-python",
+)
+def agent_tools_resource(name: AgentName) -> str:
+    """Raw tools.py text for `name` (same bytes as miragen_read_agent_file for that path).
+
+    Same error conventions as the agent.yaml resource above.
+    """
+    err = _check_agent_name(name)
+    if err:
+        raise ValueError(err)
+    if not _agent_dir(name).exists():
+        raise ValueError(f"agent '{name}' not found. Read miragen://agents to see existing agents.")
+    full, path_err = _safe_path(name, "tools.py")
+    if path_err:
+        raise ValueError(path_err)
+    if not full.exists():
+        raise FileNotFoundError(f"tools.py not found for agent '{name}'.")
+    return full.read_text()
+
+
+@mcp.resource(
+    "miragen://docs/readme",
+    name="Miragen Docs",
+    description="The miragen agent profile README, fetched once and cached (offline fallback included).",
+    mime_type="text/markdown",
+)
+def readme_resource() -> str:
+    """Serve the miragen README (same source as miragen_get_readme), cached after the first
+    successful fetch. Falls back to a short built-in schema summary if the MCP server has
+    no network access -- this never blocks or retries indefinitely.
+    """
+    global _readme_cache
+    if _readme_cache is not None:
+        return _readme_cache
+    fetched = get_miragen_readme()
+    if fetched.startswith("ERROR"):
+        return _README_FALLBACK
+    _readme_cache = fetched
+    return _readme_cache
+
+
+# ---- Prompts ------------------------------------------------------------------
+
+
+@mcp.prompt(name="create-agent")
+def create_agent_prompt(
+    purpose: Annotated[str, Field(description="What the new agent should do, in plain language.")],
+    mode: Annotated[
+        str,
+        Field(
+            description=(
+                "Agent mode: 'autonomous' (runs on its own), 'interactive' (only responds "
+                "when prompted), or 'hybrid'."
+            )
+        ),
+    ] = "autonomous",
+) -> str:
+    """Guide the model through drafting, validating, and creating a new miragen agent."""
+    return f"""Create a new miragen agent.
+
+Purpose: {purpose}
+Mode: {mode}
+
+1. Read miragen://docs/readme (or call miragen_get_readme) for the full agent.yaml schema:
+   fields, supported modes, triggers, capabilities, and the approval flow.
+2. Draft an agent.yaml profile for this purpose and mode, starting from this skeleton:
+
+   name: <lowercase-hyphenated-name>
+   mode: {mode}
+   spec:
+     model: <provider/model>
+     instructions: |
+       <what this agent should do and how>
+   tools: []
+
+3. Call miragen_validate_yaml with the draft. If it reports errors, fix the YAML and
+   validate again -- repeat until it passes.
+4. Call miragen_create_agent with the chosen agent name and the validated YAML.
+5. Check miragen_get_agent_logs to confirm it started; use miragen_register_tool next if
+   this agent needs custom tools.
+"""
 
 
 # ---------------------------------------------------------------------------

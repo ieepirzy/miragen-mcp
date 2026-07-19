@@ -28,7 +28,7 @@ Claude / AI Client
 - **Filesystem access** — read, write, and edit files in agent workspaces with path traversal protection
 - **Prompt delivery** — send prompts to running agents and retrieve responses
 - **Scheduling** — schedule one-shot prompts with a delay or at a specific time (ISO 8601)
-- **Validation** — validate agent YAML profiles before applying them
+- **Validation** — validate agent YAML profiles before applying them, and update a running agent's `agent.yaml` through a validate → apply → restart → rollback flow instead of a raw file write
 - **Logging** — tail Docker container logs per agent
 
 ## Tools
@@ -40,6 +40,7 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_list_agents` | read-only | List all agents with status, mode, and model |
 | `miragen_get_agent` | read-only | Full agent info: YAML config, container status, tools |
 | `miragen_create_agent` | write | Create workspace, register in compose, start container |
+| `miragen_update_agent_config` | **destructive**, idempotent | Validate and replace an agent's `agent.yaml`, then restart (rolls back on failure) |
 | `miragen_start_agent` | write, idempotent | Start agent container |
 | `miragen_restart_agent` | write, idempotent | Restart agent container |
 | `miragen_stop_agent` | write, idempotent | Stop agent container |
@@ -59,6 +60,25 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_get_readme` | read-only | Fetch latest Miragen README from GitHub |
 
 Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double as Docker container names, and this blocks path traversal), `miragen_register_tool` syntax-checks the submitted source and requires it to define the named `@register` function, and unbounded outputs (logs, file reads, agent responses) are truncated at 50,000 characters.
+
+## Resources & Prompts
+
+Alongside tools, the server exposes read-only **MCP resources** for clients that browse
+context instead of (or in addition to) calling tools, and one **MCP prompt** to bootstrap
+new agents. Unlike tools — which return `"ERROR: ..."` strings — resources raise on
+failure (`ValueError` for an invalid or unknown agent name, `FileNotFoundError` if the
+agent exists but the specific file doesn't), matching FastMCP's convention for resources.
+
+| Resource | MIME type | Description |
+|----------|-----------|--------------|
+| `miragen://agents` | `application/json` | Same data as `miragen_list_agents` |
+| `miragen://agents/{name}/agent.yaml` | `text/yaml` | Raw `agent.yaml` for one agent |
+| `miragen://agents/{name}/tools.py` | `text/x-python` | Raw `tools.py` source for one agent |
+| `miragen://docs/readme` | `text/markdown` | The miragen README, fetched once and cached, with a built-in offline fallback |
+
+| Prompt | Arguments | Description |
+|--------|-----------|--------------|
+| `create-agent` | `purpose` (required), `mode` (default `"autonomous"`) | Walks the model through reading the schema docs, drafting an `agent.yaml`, validating it with `miragen_validate_yaml`, and creating it with `miragen_create_agent` |
 
 ## Requirements
 
