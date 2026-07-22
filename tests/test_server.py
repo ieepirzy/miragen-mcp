@@ -775,3 +775,29 @@ def test_resource_and_prompt_decorators_accept_real_fastmcp_kwargs():
         for n in [n for n in sys.modules if _is_stubbed_dep(n)]:
             del sys.modules[n]
         sys.modules.update(saved)
+
+
+# ── _compose_add_service: internal-token propagation ─────────────────────────
+
+def test_compose_service_forwards_internal_token(tmp_path, monkeypatch):
+    """A managed agent must receive MIRAGEN_INTERNAL_TOKEN so its own /run*
+    guard is enabled with the same shared token this server authenticates with —
+    otherwise it boots unprotected while we send the header."""
+    monkeypatch.setattr(server, "COMPOSE_FILE", tmp_path / "compose.yml")
+    monkeypatch.setattr(server, "MIRAGEN_INTERNAL_TOKEN", "sekrit")
+
+    server._compose_add_service("worker")
+
+    env = server._read_yaml(tmp_path / "compose.yml")["services"]["worker"]["environment"]
+    assert env["MIRAGEN_INTERNAL_TOKEN"] == "sekrit"
+    assert env["AGENT_PROFILE"] == "agent.yaml"
+
+
+def test_compose_service_omits_token_when_unset(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "COMPOSE_FILE", tmp_path / "compose.yml")
+    monkeypatch.setattr(server, "MIRAGEN_INTERNAL_TOKEN", "")
+
+    server._compose_add_service("worker")
+
+    env = server._read_yaml(tmp_path / "compose.yml")["services"]["worker"]["environment"]
+    assert "MIRAGEN_INTERNAL_TOKEN" not in env

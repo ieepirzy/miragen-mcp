@@ -39,6 +39,22 @@ NO_AUTH = os.getenv("MCP_NO_AUTH", "false").lower() == "true"
 MCP_PATH = os.getenv("MCP_PATH", "/mcp")
 MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest")
 
+# Internal token for the agents' HTTP control APIs. When the agent containers
+# set MIRAGEN_INTERNAL_TOKEN, set the same value on this server so its calls
+# to /run, /runs/* etc. authenticate. Empty (default) sends no header.
+MIRAGEN_INTERNAL_TOKEN = os.getenv("MIRAGEN_INTERNAL_TOKEN", "")
+
+# Executor-tier contract capabilities this MCP build knows how to drive,
+# matched against the `capabilities` list a deployed miragen advertises on
+# GET /health (miragen issue #33 Phase H: report deployed-version vs
+# supported-contract mismatches clearly instead of failing obscurely).
+SUPPORTED_CONTRACT_CAPABILITIES = frozenset({
+    "edf-resolve/mirarun.io-v1alpha1",
+    "executor-launch/v1",
+    "run-snapshot/v1",
+    "events-cursor/v1",
+})
+
 # Hard cap on characters returned by tools that can produce unbounded output
 # (logs, file reads, agent responses) so a single call cannot flood an LLM
 # context window.
@@ -99,6 +115,64 @@ def _safe_path(agent: str, rel: str) -> tuple[Path | None, str | None]:
     return full, None
 
 
+# Test seam: when set (httpx.MockTransport in tests), agent HTTP calls route
+# through it instead of the docker network.
+_agent_transport = None
+
+
+def _agent_headers() -> dict:
+    return {"X-Miragen-Token": MIRAGEN_INTERNAL_TOKEN} if MIRAGEN_INTERNAL_TOKEN else {}
+
+
+async def _agent_request(
+    agent: str,
+    method: str,
+    path: str,
+    *,
+    json_body: dict | None = None,
+    params: dict | None = None,
+    timeout: float = 30,
+):
+    """One HTTP call to an agent's control API on the docker network.
+
+    Returns (parsed_json_or_text, None) on 2xx, (None, "ERROR: ...") otherwise,
+    with the same connect/timeout/status guidance run_agent has always given.
+    """
+    try:
+        async with httpx.AsyncClient(transport=_agent_transport) as client:
+            resp = await client.request(
+                method,
+                f"http://{agent}:8000{path}",
+                json=json_body,
+                params=params,
+                headers=_agent_headers(),
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            try:
+                return resp.json(), None
+            except ValueError:
+                return resp.text, None
+    except httpx.ConnectError:
+        return None, (
+            f"ERROR: could not connect to agent '{agent}'. The container is probably not "
+            "running — check with miragen_list_agents and start it with miragen_start_agent."
+        )
+    except httpx.TimeoutException:
+        return None, (
+            f"ERROR: agent '{agent}' did not respond within {timeout:.0f} seconds. "
+            "Check miragen_get_agent_logs for what it is doing."
+        )
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text[:500]
+        return None, (
+            f"ERROR: agent '{agent}' returned HTTP {exc.response.status_code}: {body}. "
+            "Check miragen_get_agent_logs for details."
+        )
+    except Exception as exc:
+        return None, f"ERROR: {exc}"
+
+
 def _container_status(name: str) -> str:
     try:
         return _docker.containers.get(name).status
@@ -148,6 +222,12 @@ def _compose_add_service(name: str) -> None:
     _ensure_agent_network()
     secret_names = _secret_names()
     env = {"AGENT_PROFILE": "agent.yaml"}
+    if MIRAGEN_INTERNAL_TOKEN:
+        # Enable the agent's own /run* guard with the same shared token this
+        # server authenticates with. Without it a managed agent boots
+        # unprotected while we send X-Miragen-Token — the header is required by
+        # no one. Forwarded as a plain value, consistent with *_API_KEY below.
+        env["MIRAGEN_INTERNAL_TOKEN"] = MIRAGEN_INTERNAL_TOKEN
     for k, v in os.environ.items():
         if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
             env[k] = v
@@ -278,6 +358,18 @@ WorkspacePath = Annotated[
             "'data/notes.md'."
         ),
         min_length=1,
+    ),
+]
+
+RunId = Annotated[
+    str,
+    Field(
+        description=(
+            "Executor run ID as returned by miragen_list_runs (uuid4 hex). A unique prefix "
+            "of at least 4 characters is accepted; ambiguous prefixes are rejected by the "
+            "agent with the candidate IDs."
+        ),
+        pattern=r"^[0-9a-f]{4,32}$",
     ),
 ]
 
@@ -1016,12 +1108,9 @@ def edit_agent_file(
 
 
 async def _fire_trigger(agent: str, prompt: str) -> None:
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(f"http://{agent}:8000/run", json={"prompt": prompt}, timeout=10)
-            resp.raise_for_status()
-        except Exception as exc:
-            logger.error("retrigger POST to %s failed: %s", agent, exc)
+    _, err = await _agent_request(agent, "POST", "/run", json_body={"prompt": prompt}, timeout=10)
+    if err:
+        logger.error("retrigger POST to %s failed: %s", agent, err)
 
 
 @mcp.tool(
@@ -1115,33 +1204,213 @@ async def run_agent(
     err = _check_agent_name(agent)
     if err:
         return err
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"http://{agent}:8000/run",
-                json={"prompt": prompt},
-                timeout=120,
-            )
-            resp.raise_for_status()
-            return _truncate(resp.json().get("output", resp.text))
-    except httpx.ConnectError:
-        return (
-            f"ERROR: could not connect to agent '{agent}'. The container is probably not "
-            "running — check with miragen_list_agents and start it with miragen_start_agent."
+    body, err = await _agent_request(
+        agent, "POST", "/run", json_body={"prompt": prompt}, timeout=120
+    )
+    if err:
+        return err
+    if isinstance(body, dict):
+        return _truncate(str(body.get("output", body)))
+    return _truncate(str(body))
+
+
+# ---- Executor runs ----------------------------------------------------------
+# The executor-tier run surfaces of the agents' control APIs (miragen issue
+# #33 Phase H): list/get/events/diff/resume/abandon. These proxy to the agent
+# over the docker network and return the agent's JSON verbatim so this server
+# never re-interprets run state.
+
+
+@mcp.tool(
+    name="miragen_list_runs",
+    annotations=_annotations("List Agent Runs", read_only=True, idempotent=True),
+)
+async def list_runs(
+    agent: AgentName,
+    limit: Annotated[
+        int, Field(description="Maximum runs to return, newest first. Default 20.", ge=1, le=100)
+    ] = 20,
+    status: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional status filter: running, succeeded, failed, interrupted, "
+                "suspended, or abandoned."
+            ),
+        ),
+    ] = None,
+) -> dict:
+    """List an agent's recent run records, newest first.
+
+    Returns the agent's own response: {"count": int, "runs": [RunSummary, ...]} where
+    each summary carries run_id, status, trigger, timing, usage, and prompt/output
+    previews. Suspended/failed runs are resumable (miragen_resume_run); use
+    miragen_get_run for one run's full record. On failure returns {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    params: dict = {"limit": limit}
+    if status is not None:
+        params["status"] = status
+    body, err = await _agent_request(agent, "GET", "/runs", params=params)
+    return body if err is None else {"error": err}
+
+
+@mcp.tool(
+    name="miragen_get_run",
+    annotations=_annotations("Get Run Record", read_only=True, idempotent=True),
+)
+async def get_run(agent: AgentName, run_id: RunId) -> dict:
+    """Get the full durable record for one run: status, exit_reason, prompt, output,
+    error, usage, thread/workspace handles, diff_path, provenance, and snapshot hash.
+
+    miragen is authoritative for run state — this record IS the run's status. On
+    failure returns {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    body, err = await _agent_request(agent, "GET", f"/runs/{run_id}")
+    return body if err is None else {"error": err}
+
+
+@mcp.tool(
+    name="miragen_get_run_events",
+    annotations=_annotations("Get Run Events", read_only=True, idempotent=True),
+)
+async def get_run_events(
+    agent: AgentName,
+    run_id: RunId,
+    limit: Annotated[
+        int, Field(description="Maximum events per read. Default 200.", ge=1, le=1000)
+    ] = 200,
+    after: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Cursor: return events with seq > after, oldest first, plus next_after/"
+                "has_more for paging. Omit for a tail read (newest `limit` events). "
+                "Requires the deployed miragen to advertise 'events-cursor/v1' — check "
+                "with miragen_check_deployment."
+            ),
+            ge=0,
+        ),
+    ] = None,
+) -> dict:
+    """Read an executor run's normalized event stream (thread/turn/item events plus
+    lifecycle timing), either as a tail read or as a cursor replay.
+
+    Every event carries a per-run monotonic `seq` — (run_id, seq) deduplicates reads.
+    On failure returns {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    params: dict = {"limit": limit}
+    if after is not None:
+        params["after"] = after
+    body, err = await _agent_request(agent, "GET", f"/runs/{run_id}/events", params=params)
+    if err is not None:
+        return {"error": err}
+    if after is not None and isinstance(body, dict) and "next_after" not in body:
+        body["warning"] = (
+            "the deployed miragen ignored the `after` cursor (pre events-cursor/v1); "
+            "this is a tail read — run miragen_check_deployment for details"
         )
-    except httpx.TimeoutException:
-        return (
-            f"ERROR: agent '{agent}' did not respond within 120 seconds. The run may still be "
-            "in progress — check miragen_get_agent_logs for its output."
-        )
-    except httpx.HTTPStatusError as exc:
-        body = exc.response.text[:500]
-        return (
-            f"ERROR: agent '{agent}' returned HTTP {exc.response.status_code}: {body}. "
-            "Check miragen_get_agent_logs for details."
-        )
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    return body
+
+
+@mcp.tool(
+    name="miragen_get_run_diff",
+    annotations=_annotations("Get Run Diff", read_only=True, idempotent=True),
+)
+async def get_run_diff(agent: AgentName, run_id: RunId) -> str:
+    """Fetch the diff harvested from an executor run's workspace — set exactly once,
+    on terminal success (404 before that; partial work on a suspended/failed run is
+    resume state, not a harvested diff).
+
+    Output longer than 50,000 characters is truncated. Returns the unified diff text
+    (possibly empty — an empty diff is still a harvested diff) or "ERROR: ...".
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return err
+    body, err = await _agent_request(agent, "GET", f"/runs/{run_id}/diff")
+    if err is not None:
+        return err
+    return _truncate(body if isinstance(body, str) else str(body))
+
+
+@mcp.tool(
+    name="miragen_resume_run",
+    annotations=_annotations("Resume Run", open_world=True),
+)
+async def resume_run(
+    agent: AgentName,
+    run_id: RunId,
+    prompt: Annotated[
+        str,
+        Field(
+            description=(
+                "Prompt for the resumed turn — e.g. what to do differently, or simply "
+                "'continue'. The executor thread and workspace from the original run "
+                "are reused."
+            ),
+            min_length=1,
+        ),
+    ],
+) -> dict:
+    """Give a suspended or failed executor run another turn on its existing thread and
+    workspace (budget suspension, timeout, or crash — all resumable states).
+
+    Synchronous: waits up to 300 seconds for the turn to finish, then returns the
+    updated run record. If it times out, the turn may still be running — poll
+    miragen_get_run. Only suspended/failed runs are resumable (409 otherwise). On
+    failure returns {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    body, err = await _agent_request(
+        agent, "POST", f"/runs/{run_id}/resume", json_body={"prompt": prompt}, timeout=300
+    )
+    return body if err is None else {"error": err}
+
+
+@mcp.tool(
+    name="miragen_abandon_run",
+    annotations=_annotations("Abandon Run", destructive=True),
+)
+async def abandon_run(
+    agent: AgentName,
+    run_id: RunId,
+    discard_workspace: Annotated[
+        bool,
+        Field(
+            description=(
+                "Also delete the run's workspace. Default false keeps it for forensics; "
+                "true is irreversible — fetch anything you need first."
+            ),
+        ),
+    ] = False,
+) -> dict:
+    """Abandon a suspended or failed executor run — the human-terminal state. The only
+    place where keep-for-forensics vs discard-workspace is decided.
+
+    Irreversible: an abandoned run cannot be resumed. Returns the final run record, or
+    {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    body, err = await _agent_request(
+        agent,
+        "POST",
+        f"/runs/{run_id}/abandon",
+        params={"discard_workspace": str(discard_workspace).lower()},
+    )
+    return body if err is None else {"error": err}
 
 
 # ---- Meta -------------------------------------------------------------------
@@ -1168,6 +1437,138 @@ def get_miragen_readme() -> str:
         return resp.text
     except Exception as exc:
         return f"ERROR: could not fetch README: {exc}. Retry, or check network access from the MCP server."
+
+
+def _local_miragen_version() -> str | None:
+    """Version of the miragen package installed in THIS container (used by
+    `miragen validate`) — can differ from what the agent containers run."""
+    try:
+        from importlib.metadata import version
+
+        return version("miragen")
+    except Exception:
+        return None
+
+
+@mcp.tool(
+    name="miragen_check_deployment",
+    annotations=_annotations("Check Deployment Compatibility", read_only=True, idempotent=True),
+)
+async def check_deployment(agent: AgentName) -> dict:
+    """Report the deployed miragen version and contract capabilities of one running
+    agent, compared against what this MCP server supports.
+
+    Returns {"agent", "deployed_version", "deployed_capabilities",
+    "mcp_local_miragen_version" (the version `miragen validate` uses here),
+    "supported_capabilities", "missing" (supported here but absent from the
+    deployment), "extra" (advertised but unknown to this server — usually a newer
+    miragen), "compatible", "notes"}. Run this before relying on the executor-run
+    or EDF contract tools; "missing" names exactly which surfaces will not work.
+    On failure returns {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    health, err = await _agent_request(agent, "GET", "/health", timeout=10)
+    if err is not None:
+        return {"error": err}
+    if not isinstance(health, dict):
+        return {"error": f"ERROR: unexpected /health response from '{agent}': {str(health)[:200]}"}
+
+    deployed_version = health.get("version")
+    deployed_capabilities = health.get("capabilities") or []
+    deployed_set = {c for c in deployed_capabilities if isinstance(c, str)}
+    missing = sorted(SUPPORTED_CONTRACT_CAPABILITIES - deployed_set)
+    extra = sorted(deployed_set - SUPPORTED_CONTRACT_CAPABILITIES)
+
+    notes: list[str] = []
+    if "capabilities" not in health:
+        notes.append(
+            "deployed miragen predates capability discovery entirely — upgrade the agent "
+            "image; executor-run inspection may work but the EDF/launch/cursor contracts "
+            "will not"
+        )
+    elif missing:
+        notes.append(
+            "the deployment does not serve: " + ", ".join(missing) + " — the corresponding "
+            "tools/parameters will fail or silently degrade; upgrade the agent image"
+        )
+    if extra:
+        notes.append(
+            "the deployment advertises capabilities unknown to this MCP server: "
+            + ", ".join(extra) + " — this server may be the outdated side"
+        )
+    if not notes:
+        notes.append("deployment and MCP server agree on the served contracts")
+
+    return {
+        "agent": agent,
+        "deployed_version": deployed_version,
+        "deployed_capabilities": deployed_capabilities,
+        "mcp_local_miragen_version": _local_miragen_version(),
+        "supported_capabilities": sorted(SUPPORTED_CONTRACT_CAPABILITIES),
+        "missing": missing,
+        "extra": extra,
+        "compatible": not missing,
+        "notes": notes,
+    }
+
+
+# Secondary docs: fixed host + strict relative-path allowlist, so this can
+# fetch linked design docs (docs/**.md) but can never be steered to another
+# host or a non-docs path. Cached per path after first success.
+_DOC_PATH_RE = re.compile(r"^(README\.md|docs(/[A-Za-z0-9._-]+)+\.md)$")
+_doc_cache: dict[str, str] = {}
+
+
+@mcp.tool(
+    name="miragen_get_doc",
+    annotations=_annotations("Get Miragen Doc", read_only=True, idempotent=True, open_world=True),
+)
+def get_miragen_doc(
+    path: Annotated[
+        str,
+        Field(
+            description=(
+                "Repository-relative markdown path in ieepirzy/miragen: 'README.md' or a "
+                "path under docs/, e.g. 'docs/executor-tier.md' or "
+                "'docs/design/mirarun-substrate-contracts.md'. Only .md files under those "
+                "locations are retrievable."
+            ),
+            min_length=1,
+        ),
+    ],
+) -> str:
+    """Fetch one miragen documentation file from GitHub — the README links secondary
+    docs (docs/executor-tier.md, docs/design/*.md) that this tool can follow, so
+    schema/design questions don't stop at the README.
+
+    Output longer than 50,000 characters is truncated. Cached after the first
+    successful fetch. Returns the markdown text or "ERROR: ...".
+    """
+    if ".." in path or not _DOC_PATH_RE.fullmatch(path):
+        return (
+            f"ERROR: '{path}' is not a retrievable doc path. Allowed: 'README.md' or a "
+            "markdown file under 'docs/', e.g. 'docs/executor-tier.md'."
+        )
+    if path in _doc_cache:
+        return _doc_cache[path]
+    try:
+        resp = httpx.get(
+            f"https://raw.githubusercontent.com/ieepirzy/miragen/main/{path}",
+            timeout=10,
+            follow_redirects=True,
+        )
+        if resp.status_code == 404:
+            return (
+                f"ERROR: '{path}' does not exist in ieepirzy/miragen. The README "
+                "(miragen_get_readme) links the docs that do."
+            )
+        resp.raise_for_status()
+        _doc_cache[path] = _truncate(resp.text)
+        return _doc_cache[path]
+    except Exception as exc:
+        return f"ERROR: could not fetch {path}: {exc}. Retry, or check network access from the MCP server."
 
 
 @mcp.tool(
