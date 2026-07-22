@@ -222,6 +222,12 @@ def _compose_add_service(name: str) -> None:
     _ensure_agent_network()
     secret_names = _secret_names()
     env = {"AGENT_PROFILE": "agent.yaml"}
+    if MIRAGEN_INTERNAL_TOKEN:
+        # Enable the agent's own /run* guard with the same shared token this
+        # server authenticates with. Without it a managed agent boots
+        # unprotected while we send X-Miragen-Token — the header is required by
+        # no one. Forwarded as a plain value, consistent with *_API_KEY below.
+        env["MIRAGEN_INTERNAL_TOKEN"] = MIRAGEN_INTERNAL_TOKEN
     for k, v in os.environ.items():
         if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
             env[k] = v
