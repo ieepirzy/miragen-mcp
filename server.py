@@ -63,6 +63,15 @@ SUPPORTED_CONTRACT_CAPABILITIES = frozenset({
 # context window.
 MAX_OUTPUT_CHARS = 50_000
 
+# Agent export/import (miragen_export_agent / miragen_import_agent). Exports are
+# tarballs of an agent workspace, excluding run history and caches; imports must
+# come from the workspace exports/ directory and extract with tarfile's "data"
+# filter (rejects absolute paths, traversal, and links).
+EXPORT_EXCLUDE_DIRS = frozenset({"runs", "__pycache__"})
+EXPORT_EXCLUDE_FILES = frozenset({"history.json"})
+MAX_EXPORT_FILE_BYTES = 10 * 1024 * 1024  # skip individual files larger than this
+MAX_ARCHIVE_BYTES = 50 * 1024 * 1024  # refuse to produce an archive larger than this
+
 # Agent names double as directory names, compose service names, and Docker
 # container names — restrict them accordingly (also blocks path traversal).
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
@@ -135,6 +144,34 @@ def _safe_path(agent: str, rel: str) -> tuple[Path | None, str | None]:
     full = (base / p).resolve()
     if not str(full).startswith(str(base) + os.sep) and full != base:
         return None, "ERROR: path traversal not allowed"
+    return full, None
+
+
+def _exports_dir() -> Path:
+    """Directory holding agent export tarballs (sibling of the agents dir)."""
+    return AGENTS_DIR.parent / "exports"
+
+
+def _safe_export_path(archive_path: str) -> tuple[Path | None, str | None]:
+    """Resolve a caller-supplied archive path and require it to live inside the
+    workspace exports/ directory. Accepts an absolute path (as returned by
+    miragen_export_agent), 'exports/<file>', or a bare '<file>'."""
+    if ".." in archive_path:
+        return None, "ERROR: path traversal not allowed"
+    base = _exports_dir().resolve()
+    p = Path(archive_path)
+    if p.is_absolute():
+        full = p.resolve()
+    else:
+        rel = p
+        if rel.parts and rel.parts[0] == "exports":
+            rel = Path(*rel.parts[1:])
+        full = (base / rel).resolve()
+    if full != base and not str(full).startswith(str(base) + os.sep):
+        return None, (
+            f"ERROR: archive_path must be inside the workspace exports/ directory. "
+            "Pass the path miragen_export_agent returned, or 'exports/<file>.tar.gz'."
+        )
     return full, None
 
 
@@ -778,6 +815,229 @@ def get_agent_logs(
         )
     except Exception as exc:
         return f"ERROR: {exc}"
+
+
+# ---- Backup & migration -----------------------------------------------------
+
+
+@mcp.tool(
+    name="miragen_export_agent",
+    annotations=_annotations("Export Agent", read_only=True, idempotent=True),
+)
+def export_agent(agent: AgentName) -> dict:
+    """Export an agent's workspace to a gzipped tarball for backup or migration.
+
+    The archive is written to the host workspace under exports/<agent>-<timestamp>.tar.gz
+    and contains agent.yaml, tools.py, and any data files. Excluded: runs/, history.json,
+    __pycache__/, and any single file over 10 MB (skipped and listed in "skipped"). The
+    compose entry and secrets are NOT exported — miragen_import_agent regenerates those
+    from the current server environment.
+
+    Returns {"agent", "archive_path" (host path), "included" (relative file list),
+    "skipped", "size_bytes", "hint"}. Refuses if the archive would exceed 50 MB. The
+    archive lives outside every agent workspace, so miragen_read_agent_file cannot fetch
+    it — copy it off the host, or import it on another miragen-mcp with
+    miragen_import_agent. On failure returns {"error": "ERROR: ..."}.
+    """
+    err = _check_agent_name(agent)
+    if err:
+        return {"error": err}
+    d = _agent_dir(agent)
+    if not d.exists():
+        return {"error": f"ERROR: agent '{agent}' not found. Use miragen_list_agents to see available agents."}
+
+    exports = _exports_dir()
+    try:
+        exports.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive_path = exports / f"{agent}-{timestamp}.tar.gz"
+
+        included: list[str] = []
+        skipped: list[dict] = []
+        members: list[tuple[Path, str]] = []
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [sub for sub in dirs if sub not in EXPORT_EXCLUDE_DIRS]
+            for fname in files:
+                fp = Path(root) / fname
+                rel = fp.relative_to(d)
+                if fname in EXPORT_EXCLUDE_FILES:
+                    skipped.append({"path": str(rel), "reason": "excluded (run history)"})
+                    continue
+                if fp.is_symlink():
+                    skipped.append({"path": str(rel), "reason": "symlink not exported"})
+                    continue
+                size = fp.stat().st_size
+                if size > MAX_EXPORT_FILE_BYTES:
+                    skipped.append(
+                        {"path": str(rel), "reason": f"exceeds 10 MB cap ({size} bytes)"}
+                    )
+                    continue
+                members.append((fp, f"{agent}/{rel.as_posix()}"))
+
+        with tarfile.open(archive_path, "w:gz") as tar:
+            for fp, arcname in members:
+                tar.add(fp, arcname=arcname, recursive=False)
+                included.append(arcname[len(agent) + 1 :])
+
+        size_bytes = archive_path.stat().st_size
+        if size_bytes > MAX_ARCHIVE_BYTES:
+            archive_path.unlink(missing_ok=True)
+            return {
+                "error": (
+                    f"ERROR: export archive would be {size_bytes} bytes, over the 50 MB cap. "
+                    "Trim large files from the agent workspace and retry."
+                )
+            }
+
+        return {
+            "agent": agent,
+            "archive_path": str(archive_path),
+            "included": sorted(included),
+            "skipped": skipped,
+            "size_bytes": size_bytes,
+            "hint": (
+                "This archive is on the host workspace, outside any agent workspace, so "
+                "miragen_read_agent_file cannot fetch it. Copy it off the host, or import it "
+                f"on another miragen-mcp with miragen_import_agent(name=..., archive_path="
+                f"'exports/{archive_path.name}'). The compose entry and secrets are not in the "
+                "archive — import regenerates them from the current server environment."
+            ),
+        }
+    except Exception as exc:
+        return {"error": f"ERROR: {exc}"}
+
+
+@mcp.tool(
+    name="miragen_import_agent",
+    annotations=_annotations("Import Agent"),
+)
+def import_agent(
+    name: AgentName,
+    archive_path: Annotated[
+        str,
+        Field(
+            description=(
+                "Path to a tarball produced by miragen_export_agent. Must resolve inside the "
+                "workspace exports/ directory — pass the archive_path that export returned, or "
+                "'exports/<file>.tar.gz'. Arbitrary host paths are refused."
+            ),
+            min_length=1,
+        ),
+    ],
+    start: Annotated[
+        bool,
+        Field(description="Start the agent's container after a successful import. Default true."),
+    ] = True,
+) -> str:
+    """Import an agent from an export tarball: extract it under a new name, validate it,
+    register it in compose.yml, and (by default) start it.
+
+    Refuses if an agent named `name` already exists (delete it first with
+    miragen_delete_agent). The archive must live in the workspace exports/ directory and is
+    extracted with tarfile's "data" filter, which rejects absolute paths, path traversal,
+    and links. The profile's 'name' field is rewritten to `name` and validated with the
+    miragen CLI before anything is registered; any failure rolls the import back completely
+    (workspace removed, compose entry removed). The compose entry and secrets are
+    regenerated from this server's environment — they are never taken from the archive.
+    Returns a success message or "ERROR: ...".
+    """
+    err = _check_agent_name(name)
+    if err:
+        return err
+    d = _agent_dir(name)
+    if d.exists():
+        return (
+            f"ERROR: agent '{name}' already exists. Delete it with miragen_delete_agent first, "
+            "or import under a different name."
+        )
+    full, perr = _safe_export_path(archive_path)
+    if perr:
+        return perr
+    if not full.exists():
+        return (
+            f"ERROR: archive not found: {archive_path}. It must be under the workspace exports/ "
+            "directory — miragen_export_agent writes archives there."
+        )
+
+    staging = None
+    created_dir = False
+    added_service = False
+    try:
+        _exports_dir().mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(dir=_exports_dir(), prefix=f".import-{name}-"))
+        try:
+            with tarfile.open(full, "r:gz") as tar:
+                tar.extractall(path=staging, filter="data")
+        except (tarfile.TarError, ValueError, OSError) as exc:
+            return (
+                f"ERROR: could not safely extract '{archive_path}': {exc}. The archive may be "
+                "corrupt or contain unsafe (absolute/traversal/link) members."
+            )
+
+        # Exports wrap everything under a single "<orig_name>/" directory; unwrap it.
+        entries = list(staging.iterdir())
+        top_dirs = [p for p in entries if p.is_dir()]
+        if len(entries) == 1 and len(top_dirs) == 1:
+            src_root = top_dirs[0]
+        else:
+            src_root = staging
+
+        yaml_src = src_root / "agent.yaml"
+        if not yaml_src.exists():
+            return (
+                "ERROR: archive has no agent.yaml at its root — it does not look like a "
+                "miragen_export_agent tarball."
+            )
+
+        # Rewrite the top-level name in place, preserving formatting/comments.
+        original_text = yaml_src.read_text()
+        rewritten, n = re.subn(r"(?m)^name:.*$", f"name: {name}", original_text, count=1)
+        if n == 0:
+            rewritten = f"name: {name}\n" + original_text
+        yaml_src.write_text(rewritten)
+
+        result = subprocess.run(
+            ["miragen", "validate", str(yaml_src)],
+            capture_output=True, text=True, cwd=WORKSPACE,
+        )
+        if result.returncode != 0:
+            return (
+                f"ERROR: imported profile failed validation:\n{(result.stdout + result.stderr).strip()}\n"
+                "The import was rolled back. Fix the source agent and re-export."
+            )
+
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_root), str(d))
+        created_dir = True
+
+        _compose_add_service(name)
+        added_service = True
+
+        if start:
+            up = subprocess.run(
+                ["docker", "compose", "up", "-d", name],
+                capture_output=True, text=True, cwd=WORKSPACE,
+            )
+            if up.returncode != 0:
+                _compose_remove_service(name)
+                shutil.rmtree(d, ignore_errors=True)
+                return f"ERROR: agent imported but container failed to start:\n{up.stderr.strip()}"
+
+        tail = (
+            f"Agent {name} imported from {Path(archive_path).name} and started."
+            if start
+            else f"Agent {name} imported from {Path(archive_path).name} (not started; use miragen_start_agent)."
+        )
+        return tail + " Register any missing secrets and check miragen_get_agent_logs."
+    except Exception as exc:
+        if added_service:
+            _compose_remove_service(name)
+        if created_dir:
+            shutil.rmtree(d, ignore_errors=True)
+        return f"ERROR: {exc}"
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 # ---- Tool management --------------------------------------------------------

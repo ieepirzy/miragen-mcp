@@ -923,3 +923,234 @@ def test_compose_service_omits_token_when_unset(tmp_path, monkeypatch):
 
     env = server._read_yaml(tmp_path / "compose.yml")["services"]["worker"]["environment"]
     assert "MIRAGEN_INTERNAL_TOKEN" not in env
+
+
+# ── export / import agent (issue #6) ──────────────────────────────────────────
+
+import io
+import tarfile
+
+
+def _make_agent(agents_dir, name, *, with_extras=True):
+    d = agents_dir / name
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text(f"name: {name}\nmode: autonomous\ntools: []\n")
+    (d / "tools.py").write_text("from miragen import register\n")
+    if with_extras:
+        (d / "runs").mkdir()
+        (d / "runs" / "run1.json").write_text('{"id": 1}')
+        (d / "history.json").write_text("[]")
+        pyc = d / "__pycache__"
+        pyc.mkdir()
+        (pyc / "x.pyc").write_text("junk")
+        data = d / "data"
+        data.mkdir()
+        (data / "notes.md").write_text("# notes")
+    return d
+
+
+def _archive_members(path):
+    with tarfile.open(path, "r:gz") as tar:
+        return sorted(m.name for m in tar.getmembers())
+
+
+def test_export_agent_excludes_runs_history_pycache(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    _make_agent(tmp_path / "agents", "worker")
+
+    result = server.export_agent("worker")
+    assert "error" not in result, result
+    assert result["agent"] == "worker"
+    assert result["included"] == ["agent.yaml", "data/notes.md", "tools.py"]
+
+    members = _archive_members(result["archive_path"])
+    assert "worker/agent.yaml" in members
+    assert "worker/data/notes.md" in members
+    assert not any("runs/" in m for m in members)
+    assert not any("history.json" in m for m in members)
+    assert not any("__pycache__" in m for m in members)
+
+
+def test_export_agent_skips_large_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "MAX_EXPORT_FILE_BYTES", 16)
+    d = _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    (d / "big.bin").write_bytes(b"x" * 64)
+
+    result = server.export_agent("worker")
+    assert "big.bin" not in result["included"]
+    assert any(s["path"] == "big.bin" and "10 MB" in s["reason"] for s in result["skipped"])
+
+
+def test_export_agent_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    result = server.export_agent("ghost")
+    assert result["error"].startswith("ERROR: agent 'ghost' not found")
+
+
+def test_export_agent_invalid_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    result = server.export_agent("Bad Name!")
+    assert result["error"].startswith("ERROR: invalid agent name")
+
+
+def test_export_agent_refuses_oversized_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "MAX_ARCHIVE_BYTES", 1)  # anything real exceeds 1 byte
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    result = server.export_agent("worker")
+    assert result["error"].startswith("ERROR: export archive would be")
+    # the oversized archive is cleaned up
+    assert list((tmp_path / "exports").glob("*.tar.gz")) == []
+
+
+def _ok_proc(*a, **k):
+    from unittest.mock import MagicMock
+
+    return MagicMock(returncode=0, stdout="", stderr="")
+
+
+def test_import_round_trips_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
+    monkeypatch.setattr(server.subprocess, "run", _ok_proc)
+    _make_agent(tmp_path / "agents", "worker")
+
+    export = server.export_agent("worker")
+    # simulate deletion of the source workspace, then import under a new name
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / "agents" / "worker")
+
+    result = server.import_agent("worker-copy", export["archive_path"])
+    assert result.startswith("Agent worker-copy imported"), result
+
+    d = tmp_path / "agents" / "worker-copy"
+    assert (d / "tools.py").read_text() == "from miragen import register\n"
+    yaml_text = (d / "agent.yaml").read_text()
+    assert "name: worker-copy" in yaml_text
+    assert "name: worker\n" not in yaml_text
+    # runs/history/pycache were never in the archive
+    assert not (d / "runs").exists()
+    assert not (d / "history.json").exists()
+
+
+def test_import_accepts_relative_exports_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
+    monkeypatch.setattr(server.subprocess, "run", _ok_proc)
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    export = server.export_agent("worker")
+    fname = pytest.importorskip("pathlib").Path(export["archive_path"]).name
+
+    result = server.import_agent("copy", f"exports/{fname}", start=False)
+    assert result.startswith("Agent copy imported")
+    assert "not started" in result
+
+
+def test_import_rejects_existing_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    result = server.import_agent("worker", "exports/whatever.tar.gz")
+    assert result.startswith("ERROR: agent 'worker' already exists")
+
+
+def test_import_rejects_path_outside_exports(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    for bad in ["/etc/passwd", "../secrets.tar.gz", "exports/../evil.tar.gz"]:
+        result = server.import_agent("copy", bad)
+        assert result.startswith("ERROR")
+
+
+def test_import_missing_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    result = server.import_agent("copy", "exports/nope.tar.gz")
+    assert result.startswith("ERROR: archive not found")
+
+
+def _write_tar(path, members):
+    """members: list of (name, bytes|None). None => craft a raw TarInfo (for
+    malicious names tarfile.add would sanitize)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w:gz") as tar:
+        for name, content in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+
+
+def test_import_rejects_traversal_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    archive = tmp_path / "exports" / "evil.tar.gz"
+    _write_tar(archive, [
+        ("copy/agent.yaml", b"name: copy\n"),
+        ("../evil.txt", b"pwned"),
+    ])
+    result = server.import_agent("copy", "exports/evil.tar.gz")
+    assert result.startswith("ERROR: could not safely extract")
+    assert not (tmp_path / "agents" / "copy").exists()
+    # no stray traversal file landed next to exports/
+    assert not (tmp_path / "evil.txt").exists()
+
+
+def test_import_neutralizes_absolute_path_archive(tmp_path, monkeypatch):
+    # tarfile's "data" filter strips leading slashes rather than raising, so an
+    # absolute member is neutralized to a path *inside* the staging dir and never
+    # escapes. Here it lands as staging/opt/evil.txt (no agent.yaml at root), so the
+    # import is still rejected and nothing is written to the real /opt/evil.txt.
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    escape_target = tmp_path / "opt" / "evil.txt"
+    archive = tmp_path / "exports" / "abs.tar.gz"
+    _write_tar(archive, [(str(escape_target), b"pwned")])
+    result = server.import_agent("copy", "exports/abs.tar.gz")
+    assert result.startswith("ERROR")
+    assert not (tmp_path / "agents" / "copy").exists()
+    assert not escape_target.exists()  # the absolute path did not escape staging
+
+
+def test_import_rolls_back_on_validation_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    add_called = []
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: add_called.append(name))
+    monkeypatch.setattr(
+        server.subprocess, "run",
+        lambda *a, **k: __import__("unittest").mock.MagicMock(returncode=1, stdout="bad schema", stderr=""),
+    )
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    export = server.export_agent("worker")
+
+    result = server.import_agent("copy", export["archive_path"])
+    assert result.startswith("ERROR: imported profile failed validation")
+    assert not (tmp_path / "agents" / "copy").exists()
+    assert add_called == []  # never registered in compose
+
+
+def test_import_rolls_back_on_start_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    removed = []
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
+    monkeypatch.setattr(server, "_compose_remove_service", lambda name: removed.append(name))
+
+    calls = {"n": 0}
+
+    def run(*a, **k):
+        from unittest.mock import MagicMock
+
+        calls["n"] += 1
+        if calls["n"] == 1:  # validate
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return MagicMock(returncode=1, stdout="", stderr="boom")  # docker compose up
+
+    monkeypatch.setattr(server.subprocess, "run", run)
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    export = server.export_agent("worker")
+
+    result = server.import_agent("copy", export["archive_path"])
+    assert result.startswith("ERROR: agent imported but container failed to start")
+    assert not (tmp_path / "agents" / "copy").exists()
+    assert removed == ["copy"]

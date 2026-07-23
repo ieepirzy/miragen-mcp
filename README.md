@@ -28,6 +28,7 @@ Claude / AI Client
 - **Filesystem access** — read, write, and edit files in agent workspaces with path traversal protection
 - **Prompt delivery** — send prompts to running agents and retrieve responses
 - **Scheduling** — schedule, list, and cancel one-shot prompts with a delay or at a specific time (ISO 8601); schedules persist in a SQLite job store on the workspace volume and survive an MCP server restart
+- **Backup & migration** — export an agent workspace to a tarball and re-import it under a new name, on the same host or another (safe extraction, profile revalidated)
 - **Validation** — validate agent YAML profiles before applying them, and update a running agent's `agent.yaml` through a validate → apply → restart → rollback flow instead of a raw file write
 - **Logging** — tail Docker container logs per agent
 
@@ -46,6 +47,8 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_stop_agent` | write, idempotent | Stop agent container |
 | `miragen_delete_agent` | **destructive** | Stop, remove container, and delete workspace |
 | `miragen_get_agent_logs` | read-only | Tail Docker container logs (max 1000 lines) |
+| `miragen_export_agent` | read-only | Tar an agent workspace to `exports/` for backup/migration (excludes runs, history, caches) |
+| `miragen_import_agent` | write | Import an agent from an export tarball under a new name (safe extraction, validated) |
 | `miragen_list_tools` | read-only | List `@register` tools in agent's `tools.py` |
 | `miragen_get_tool_source` | read-only | Get source code of a specific tool |
 | `miragen_register_tool` | write | Append new tool to `tools.py` and update `agent.yaml` |
@@ -213,6 +216,22 @@ $MIRAGEN_WORKSPACE/
 Both `retriggers.sqlite` and `exports/` live on the mounted workspace volume, so scheduled retriggers and agent exports survive container restarts.
 
 Agent workspace directories are mounted to `/agent` inside each container, so filesystem changes made through the MCP tools are visible to the running agent immediately (tool changes trigger an automatic restart).
+
+### Backup, restore, and cloning
+
+`miragen_export_agent` tars an agent's workspace to `exports/<agent>-<timestamp>.tar.gz`, excluding `runs/`, `history.json`, `__pycache__/`, and any single file over 10 MB (skipped files are reported). The compose entry and secrets are **not** exported — an import regenerates them from the importing server's environment.
+
+`miragen_import_agent` extracts an export tarball under a new name, revalidates the profile, registers it in compose, and starts it. Extraction uses tarfile's `data` filter, so archives with absolute paths, `..` traversal, or links are rejected.
+
+```text
+# back up, then restore as a clone
+miragen_export_agent(agent="briefing")
+  → exports/briefing-20260723-120000.tar.gz
+miragen_import_agent(name="briefing-staging",
+                     archive_path="exports/briefing-20260723-120000.tar.gz")
+```
+
+The exported archive lives outside every agent workspace, so `miragen_read_agent_file` cannot fetch it; copy it off the host (or between hosts) yourself, then import it on the destination server.
 
 ## Authentication
 
