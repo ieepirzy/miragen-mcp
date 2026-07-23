@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,8 @@ import uvicorn
 import docker
 import httpx
 import yaml
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from fastmcp import FastMCP
@@ -70,7 +73,27 @@ _AGENT_NAME_RE = re.compile(AGENT_NAME_PATTERN)
 # ---------------------------------------------------------------------------
 
 _docker = docker.from_env()
-_scheduler = AsyncIOScheduler()
+
+# Retrigger schedules persist across restarts in a SQLite job store on the
+# mounted workspace volume (not the default in-memory store, which drops every
+# scheduled prompt when this container restarts). SQLAlchemyJobStore pickles the
+# job callable *by reference*, so `_fire_trigger` MUST stay a module-level
+# function in this module — do not nest it or turn it into a closure/lambda, or
+# unpickling on restart will fail.
+RETRIGGER_DB_PATH = WORKSPACE / "retriggers.sqlite"
+_scheduler = AsyncIOScheduler(
+    jobstores={"default": SQLAlchemyJobStore(url=f"sqlite:///{RETRIGGER_DB_PATH}")}
+)
+
+# Grace period for retriggers whose fire time passed while this server was down:
+# on restart within this many seconds of the missed fire time the job still
+# runs; older misses are dropped (APScheduler default behaviour).
+RETRIGGER_MISFIRE_GRACE = 3600
+
+# Scheduled retrigger job ids are "retrigger-<agent>-<unix_ts>". Agent names may
+# contain hyphens, so parse the agent as everything between the fixed prefix and
+# the trailing "-<digits>" timestamp.
+_RETRIGGER_ID_RE = re.compile(r"^retrigger-(?P<agent>.+)-\d+$")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1108,9 +1131,18 @@ def edit_agent_file(
 
 
 async def _fire_trigger(agent: str, prompt: str) -> None:
+    # Module-level by contract: the persistent SQLAlchemy job store pickles this
+    # callable by reference (module path + qualname). Keep it top-level so jobs
+    # scheduled before a restart can be unpickled and fired afterwards.
     _, err = await _agent_request(agent, "POST", "/run", json_body={"prompt": prompt}, timeout=10)
     if err:
         logger.error("retrigger POST to %s failed: %s", agent, err)
+
+
+def _retrigger_agent(job_id: str) -> str | None:
+    """Extract the agent name from a 'retrigger-<agent>-<ts>' job id, or None."""
+    m = _RETRIGGER_ID_RE.fullmatch(job_id)
+    return m.group("agent") if m else None
 
 
 @mcp.tool(
@@ -1144,7 +1176,11 @@ def set_retrigger(
 
     Provide exactly one of `delay_seconds` or `at`. The delivery is fire-and-forget —
     check miragen_get_agent_logs afterwards to see the run. The agent must be running
-    when the schedule fires. Returns a confirmation with the fire time, or "ERROR: ...".
+    when the schedule fires. Schedules are persisted and survive an MCP server restart
+    (a miss during downtime still fires if the server comes back within an hour). The
+    returned job_id can be passed to miragen_cancel_retrigger; see all scheduled jobs
+    with miragen_list_retriggers. Returns a confirmation with the fire time and job_id,
+    or "ERROR: ...".
     """
     err = _check_agent_name(agent)
     if err:
@@ -1169,14 +1205,94 @@ def set_retrigger(
             if fire_at <= datetime.now(timezone.utc):
                 return f"ERROR: {fire_at.isoformat()} is in the past. Provide a future datetime."
 
+        job_id = f"retrigger-{agent}-{fire_at.timestamp():.0f}"
         _scheduler.add_job(
             _fire_trigger,
             trigger=DateTrigger(run_date=fire_at),
             args=[agent, prompt],
-            id=f"retrigger-{agent}-{fire_at.timestamp():.0f}",
+            id=job_id,
             replace_existing=True,
+            misfire_grace_time=RETRIGGER_MISFIRE_GRACE,
         )
-        return f"Retrigger scheduled for {agent} at {fire_at.isoformat()}."
+        return (
+            f"Retrigger scheduled for {agent} at {fire_at.isoformat()} (job_id: {job_id}). "
+            "Cancel it with miragen_cancel_retrigger, or list all with miragen_list_retriggers."
+        )
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+@mcp.tool(
+    name="miragen_list_retriggers",
+    annotations=_annotations("List Scheduled Retriggers", read_only=True, idempotent=True),
+)
+def list_retriggers(
+    agent: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional agent name to filter by. When given, only retriggers scheduled for "
+                "that agent are returned. Omit to list scheduled retriggers for every agent."
+            ),
+        ),
+    ] = None,
+) -> dict:
+    """List the one-shot prompt retriggers currently scheduled (from miragen_set_retrigger).
+
+    Returns: {"count": int, "retriggers": [{"job_id", "agent", "fire_at" (ISO 8601, or null
+    if the job is paused), "prompt_preview" (first 200 chars)}, ...]}. Retriggers persist
+    across restarts, so this reflects everything still pending. Cancel one with
+    miragen_cancel_retrigger. On an invalid `agent` returns {"error": "ERROR: ..."}.
+    """
+    if agent is not None:
+        err = _check_agent_name(agent)
+        if err:
+            return {"error": err}
+    prefix = f"retrigger-{agent}-" if agent is not None else "retrigger-"
+    retriggers = []
+    for job in _scheduler.get_jobs():
+        if not job.id.startswith(prefix):
+            continue
+        prompt_preview = ""
+        if job.args and len(job.args) > 1:
+            prompt_preview = str(job.args[1])[:200]
+        next_run = getattr(job, "next_run_time", None)
+        retriggers.append(
+            {
+                "job_id": job.id,
+                "agent": _retrigger_agent(job.id),
+                "fire_at": next_run.isoformat() if next_run else None,
+                "prompt_preview": prompt_preview,
+            }
+        )
+    return {"count": len(retriggers), "retriggers": retriggers}
+
+
+@mcp.tool(
+    name="miragen_cancel_retrigger",
+    annotations=_annotations("Cancel Scheduled Retrigger", destructive=False, idempotent=True),
+)
+def cancel_retrigger(
+    job_id: Annotated[
+        str,
+        Field(
+            description="Job id as returned by miragen_list_retriggers or by miragen_set_retrigger.",
+            min_length=1,
+        ),
+    ],
+) -> str:
+    """Cancel a scheduled retrigger by its job id so it never fires.
+
+    Use miragen_list_retriggers to find job ids. Returns "Retrigger <job_id> cancelled." or,
+    if there is no such job, an actionable "ERROR: ..." naming miragen_list_retriggers.
+    """
+    try:
+        _scheduler.remove_job(job_id)
+        return f"Retrigger '{job_id}' cancelled."
+    except JobLookupError:
+        return (
+            f"ERROR: no retrigger '{job_id}'. Use miragen_list_retriggers to see scheduled jobs."
+        )
     except Exception as exc:
         return f"ERROR: {exc}"
 
@@ -1812,6 +1928,9 @@ _original_lifespan = app.router.lifespan_context
 @asynccontextmanager
 async def _lifespan(scope):
     async with _original_lifespan(scope):
+        # The persistent retrigger store writes retriggers.sqlite here, so the
+        # workspace must exist before the scheduler starts.
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
         _ensure_agent_network()
         _scheduler.start()
         yield

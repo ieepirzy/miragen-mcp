@@ -27,7 +27,7 @@ Claude / AI Client
 - **Tool management** — register, edit, and delete `@register`-decorated tools in an agent's `tools.py` using AST-based parsing
 - **Filesystem access** — read, write, and edit files in agent workspaces with path traversal protection
 - **Prompt delivery** — send prompts to running agents and retrieve responses
-- **Scheduling** — schedule one-shot prompts with a delay or at a specific time (ISO 8601)
+- **Scheduling** — schedule, list, and cancel one-shot prompts with a delay or at a specific time (ISO 8601); schedules persist in a SQLite job store on the workspace volume and survive an MCP server restart
 - **Validation** — validate agent YAML profiles before applying them, and update a running agent's `agent.yaml` through a validate → apply → restart → rollback flow instead of a raw file write
 - **Logging** — tail Docker container logs per agent
 
@@ -55,7 +55,9 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_write_agent_file` | **destructive** | Write/create a file in agent workspace |
 | `miragen_edit_agent_file` | **destructive** | String-replace edit a file in agent workspace |
 | `miragen_run_agent` | open-world | Send a prompt to agent's `/run` endpoint |
-| `miragen_set_retrigger` | open-world | Schedule a one-shot prompt (delay or absolute time) |
+| `miragen_set_retrigger` | open-world | Schedule a one-shot prompt (delay or absolute time); survives restarts |
+| `miragen_list_retriggers` | read-only | List scheduled retriggers (job id, agent, fire time, prompt preview); filter by agent |
+| `miragen_cancel_retrigger` | idempotent | Cancel a scheduled retrigger by job id |
 | `miragen_list_runs` | read-only | List an agent's run records, newest first (optional status filter) |
 | `miragen_get_run` | read-only | Full durable record for one run (status, usage, provenance, handles) |
 | `miragen_get_run_events` | read-only | Run event stream: tail read or cursor replay (`after`/`limit`) |
@@ -197,6 +199,8 @@ Append `_FILE` to any key variable to read from a Docker secret instead (e.g. `A
 ```
 $MIRAGEN_WORKSPACE/
 ├── compose.yml          ← managed by miragen-mcp
+├── retriggers.sqlite    ← persistent scheduled-retrigger store (APScheduler)
+├── exports/             ← agent export tarballs (miragen_export_agent)
 └── agents/
     ├── agent-a/
     │   ├── agent.yaml   ← Miragen profile
@@ -205,6 +209,8 @@ $MIRAGEN_WORKSPACE/
         ├── agent.yaml
         └── tools.py
 ```
+
+Both `retriggers.sqlite` and `exports/` live on the mounted workspace volume, so scheduled retriggers and agent exports survive container restarts.
 
 Agent workspace directories are mounted to `/agent` inside each container, so filesystem changes made through the MCP tools are visible to the running agent immediately (tool changes trigger an automatic restart).
 

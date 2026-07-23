@@ -324,6 +324,128 @@ def test_retrigger_past_datetime():
     assert "past" in result
 
 
+# ── set_retrigger job id + persistence knobs ──────────────────────────────────
+
+def test_retrigger_success_reports_job_id_and_grace(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.set_retrigger("worker", "do something", delay_seconds=60)
+
+    assert result.startswith("Retrigger scheduled")
+    assert "job_id: retrigger-worker-" in result
+    assert "miragen_cancel_retrigger" in result
+    # persistence knobs are passed through to APScheduler
+    _, kwargs = sched.add_job.call_args
+    assert kwargs["misfire_grace_time"] == server.RETRIGGER_MISFIRE_GRACE
+    assert kwargs["id"].startswith("retrigger-worker-")
+
+
+# ── _retrigger_agent parsing (hyphenated names) ───────────────────────────────
+
+@pytest.mark.parametrize("job_id,expected", [
+    ("retrigger-worker-1751450000", "worker"),
+    ("retrigger-my-hyphenated-agent-1751450000", "my-hyphenated-agent"),
+    ("retrigger-a_b-1751450000", "a_b"),
+    ("not-a-retrigger", None),
+    ("retrigger-worker", None),
+])
+def test_retrigger_agent_parsing(job_id, expected):
+    assert server._retrigger_agent(job_id) == expected
+
+
+# ── list_retriggers ───────────────────────────────────────────────────────────
+
+def _fake_job(job_id, args, next_run="2030-01-01T00:00:00+00:00"):
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    job = MagicMock()
+    job.id = job_id
+    job.args = args
+    job.next_run_time = datetime.fromisoformat(next_run) if next_run else None
+    return job
+
+
+def test_list_retriggers_all_and_preview(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.get_jobs.return_value = [
+        _fake_job("retrigger-worker-1751450000", ["worker", "hello world"]),
+        _fake_job("retrigger-scribe-1751460000", ["scribe", "x" * 500]),
+        _fake_job("some-other-job", ["irrelevant"]),  # not a retrigger, filtered out
+    ]
+    monkeypatch.setattr(server, "_scheduler", sched)
+
+    result = server.list_retriggers()
+    assert result["count"] == 2
+    ids = {r["job_id"] for r in result["retriggers"]}
+    assert ids == {"retrigger-worker-1751450000", "retrigger-scribe-1751460000"}
+    worker = next(r for r in result["retriggers"] if r["agent"] == "worker")
+    assert worker["prompt_preview"] == "hello world"
+    assert worker["fire_at"] == "2030-01-01T00:00:00+00:00"
+    scribe = next(r for r in result["retriggers"] if r["agent"] == "scribe")
+    assert len(scribe["prompt_preview"]) == 200
+
+
+def test_list_retriggers_filters_by_agent(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.get_jobs.return_value = [
+        _fake_job("retrigger-worker-1751450000", ["worker", "a"]),
+        _fake_job("retrigger-worker2-1751460000", ["worker2", "b"]),
+    ]
+    monkeypatch.setattr(server, "_scheduler", sched)
+
+    result = server.list_retriggers(agent="worker")
+    # prefix "retrigger-worker-" must not also match "retrigger-worker2-"
+    assert result["count"] == 1
+    assert result["retriggers"][0]["agent"] == "worker"
+
+
+def test_list_retriggers_invalid_agent():
+    result = server.list_retriggers(agent="Bad Name!")
+    assert result["error"].startswith("ERROR: invalid agent name")
+
+
+def test_list_retriggers_handles_paused_job(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.get_jobs.return_value = [
+        _fake_job("retrigger-worker-1751450000", ["worker", "a"], next_run=None),
+    ]
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.list_retriggers()
+    assert result["retriggers"][0]["fire_at"] is None
+
+
+# ── cancel_retrigger ──────────────────────────────────────────────────────────
+
+def test_cancel_retrigger_success(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.cancel_retrigger("retrigger-worker-1751450000")
+    assert result == "Retrigger 'retrigger-worker-1751450000' cancelled."
+    sched.remove_job.assert_called_once_with("retrigger-worker-1751450000")
+
+
+def test_cancel_retrigger_unknown_id(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.remove_job.side_effect = server.JobLookupError("nope")
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.cancel_retrigger("retrigger-worker-000")
+    assert result.startswith("ERROR: no retrigger")
+    assert "miragen_list_retriggers" in result
+
+
 # ── delete_tool ───────────────────────────────────────────────────────────────
 
 def test_delete_tool_removes_function_and_yaml_entry(tmp_path, monkeypatch):
