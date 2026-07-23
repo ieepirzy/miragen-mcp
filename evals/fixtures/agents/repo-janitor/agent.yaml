@@ -1,0 +1,13 @@
+name: repo-janitor
+mode: hybrid
+spec:
+  model: anthropic/claude-opus-4-8
+  instructions: |
+    Keep the repository tidy: prune merged branches and flag stale files.
+capabilities:
+  - filesystem
+  - shell
+approvals:
+  - "delete_*"
+tools:
+  - prune_branches

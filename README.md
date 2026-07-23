@@ -248,6 +248,28 @@ pytest tests/
 
 Tests mock Docker, OAuth, and the scheduler — no running Docker daemon required.
 
+## Evaluations
+
+`evals/` measures whether an LLM can actually accomplish realistic, **read-only** tasks with these tools against a deterministic fixture workspace (`evals/fixtures/`, four agents with distinct modes, models, capabilities, approval globs, and tools). The fixtures are the ground truth: `evals/ground_truth.py` derives every expected answer from them.
+
+- **`evals/eval.xml`** — 10 questions, each with a single string-comparable answer and the read-only tools it relies on.
+- **`evals/check_evals.py`** — deterministic, no API key. Asserts every `eval.xml` answer still derives from the fixtures and that every referenced tool is read-only (source of truth: the `readOnlyHint` annotations in `server.py`). Runs in CI, and `tests/test_evals.py` additionally reproduces each answer by driving the real tools.
+
+  ```bash
+  python evals/check_evals.py
+  ```
+
+- **`evals/run_evals.py`** — the manual, paid LLM run. Drives an Anthropic model through the server's read-only tools (over FastMCP's in-memory transport) and prints a per-question pass/fail scorecard. Only read-only tools are exposed, so no eval can mutate state.
+
+  ```bash
+  pip install anthropic fastmcp
+  export ANTHROPIC_API_KEY=sk-...
+  python evals/run_evals.py                       # all questions
+  EVAL_MODEL=claude-haiku-4-5-20251001 python evals/run_evals.py --id cheapest-model
+  ```
+
+To add a question: extend the fixtures, add a branch to `ground_truth.compute_answers()`, then add an `<eval>` to `eval.xml` with the derived answer and the read-only tools it needs. `check_evals.py` will fail until the three agree.
+
 ## License
 
 MIT

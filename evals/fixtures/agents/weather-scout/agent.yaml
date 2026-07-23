@@ -1,0 +1,13 @@
+name: weather-scout
+mode: autonomous
+spec:
+  model: anthropic/claude-haiku-4-5
+  instructions: |
+    Pull weather data on a schedule and post a short daily conditions summary.
+capabilities:
+  - network
+approvals:
+  - "publish_*"
+tools:
+  - get_current_weather
+  - fetch_forecast

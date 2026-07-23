@@ -1,0 +1,15 @@
+name: metrics-reporter
+mode: autonomous
+spec:
+  model: anthropic/claude-sonnet-5
+  instructions: |
+    Collect service metrics, render charts, and publish a scheduled report.
+capabilities:
+  - filesystem
+  - network
+approvals: []
+tools:
+  - collect_metrics
+  - render_chart
+  - write_report
+  - publish_report

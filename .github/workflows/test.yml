@@ -19,3 +19,7 @@ jobs:
       # python -m pytest (not bare pytest) so the repo root — where server.py
       # lives — is on sys.path for the test imports.
       - run: python -m pytest tests/ -q
+      # Eval-suite consistency (mcp-builder Phase 4): assert every eval.xml
+      # answer still derives from the fixtures and touches only read-only tools.
+      # No ANTHROPIC_API_KEY — the paid LLM run (evals/run_evals.py) is manual.
+      - run: python evals/check_evals.py
