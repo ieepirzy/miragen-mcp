@@ -47,7 +47,7 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_stop_agent` | write, idempotent | Stop agent container |
 | `miragen_delete_agent` | **destructive** | Stop, remove container, and delete workspace |
 | `miragen_get_agent_logs` | read-only | Tail Docker container logs (max 1000 lines) |
-| `miragen_export_agent` | read-only | Tar an agent workspace to `exports/` for backup/migration (excludes runs, history, caches) |
+| `miragen_export_agent` | write | Tar an agent workspace to `exports/` for backup/migration (excludes runs, history, caches) |
 | `miragen_import_agent` | write | Import an agent from an export tarball under a new name (safe extraction, validated) |
 | `miragen_list_tools` | read-only | List `@register` tools in agent's `tools.py` |
 | `miragen_get_tool_source` | read-only | Get source code of a specific tool |

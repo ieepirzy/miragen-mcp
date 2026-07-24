@@ -822,7 +822,12 @@ def get_agent_logs(
 
 @mcp.tool(
     name="miragen_export_agent",
-    annotations=_annotations("Export Agent", read_only=True, idempotent=True),
+    # Not read-only: each call writes a new tarball under exports/, so it mutates
+    # host storage. Marking it readOnlyHint would let a read-only-scoped session
+    # (and the eval harness, which filters on that hint) create archives at will.
+    # Not idempotent either — the filename is timestamped, so every call is a new
+    # artifact.
+    annotations=_annotations("Export Agent"),
 )
 def export_agent(agent: AgentName) -> dict:
     """Export an agent's workspace to a gzipped tarball for backup or migration.
