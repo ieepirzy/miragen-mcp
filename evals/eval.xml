@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Evaluation questions for the miragen-mcp server (mcp-builder Phase 4).
+
+  Each <eval> is:
+    - independent: answerable on its own, in any order;
+    - read-only: solvable with the read-only tools listed in <tools> and no
+      state-mutating call (enforced by check_evals.py / test_evals.py);
+    - multi-step: needs a discovery call plus a detail call in the common case;
+    - realistic: the kind of question an operator actually asks;
+    - single-answer: one string, compared case-insensitively after trimming;
+    - stable: derives from the checked-in fixtures, whose ground truth is
+      regenerated and diffed by evals/ground_truth.py.
+
+  The <answer> is the source of truth for scoring the LLM run; the deterministic
+  check asserts it still equals what ground_truth.compute_answers() derives from
+  the fixtures. To add a question: extend the fixtures, add a branch to
+  ground_truth.compute_answers(), then add an <eval> here with the derived answer.
+-->
+<evals>
+  <eval id="cheapest-model">
+    <question>Considering every agent in the workspace, which one runs on the cheapest model? Answer with just the agent name.</question>
+    <answer>weather-scout</answer>
+    <tools>miragen_list_agents</tools>
+  </eval>
+
+  <eval id="most-expensive-model">
+    <question>Which agent runs on the most expensive model, and what is that model string? Answer as "&lt;agent&gt;: &lt;model&gt;".</question>
+    <answer>repo-janitor: anthropic/claude-opus-4-8</answer>
+    <tools>miragen_list_agents</tools>
+  </eval>
+
+  <eval id="aliased-tool-name">
+    <question>Exactly one agent registers a tool under a name that differs from its Python function name. What is that registered tool name?</question>
+    <answer>fetch_forecast</answer>
+    <tools>miragen_list_agents miragen_list_tools miragen_read_agent_file</tools>
+  </eval>
+
+  <eval id="total-tool-count">
+    <question>How many @register-decorated tools are defined across all agents combined? Answer with a single number.</question>
+    <answer>10</answer>
+    <tools>miragen_list_agents miragen_list_tools</tools>
+  </eval>
+
+  <eval id="total-approval-globs">
+    <question>Summing across all agents, how many approval globs are declared in total (the entries under each agent's approvals list)? Answer with a single number.</question>
+    <answer>4</answer>
+    <tools>miragen_list_agents miragen_get_agent</tools>
+  </eval>
+
+  <eval id="filesystem-non-autonomous">
+    <question>Which agent declares the "filesystem" capability but does not run in autonomous mode? Answer with the agent name.</question>
+    <answer>repo-janitor</answer>
+    <tools>miragen_list_agents miragen_get_agent</tools>
+  </eval>
+
+  <eval id="forecast-docstring-line">
+    <question>What is the first line of the docstring of the tool registered as "fetch_forecast"? Answer with the exact text.</question>
+    <answer>Return the 7-day forecast for a city.</answer>
+    <tools>miragen_list_agents miragen_list_tools</tools>
+  </eval>
+
+  <eval id="agent-with-most-tools">
+    <question>Which agent defines the most tools, and how many does it define? Answer as "&lt;agent&gt;: &lt;count&gt;".</question>
+    <answer>metrics-reporter: 4</answer>
+    <tools>miragen_list_agents miragen_list_tools</tools>
+  </eval>
+
+  <eval id="report-schedule">
+    <question>In the agent named "metrics-reporter", read the file "config/report.yaml". What is the value of its "schedule" key?</question>
+    <answer>daily</answer>
+    <tools>miragen_read_agent_file</tools>
+  </eval>
+
+  <eval id="delete-glob-agents">
+    <question>Which agents declare an approval glob that would match a tool named "delete_thread"? List the agent names alphabetically, comma-separated.</question>
+    <answer>inbox-triage, repo-janitor</answer>
+    <tools>miragen_list_agents miragen_get_agent</tools>
+  </eval>
+</evals>

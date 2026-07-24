@@ -27,7 +27,8 @@ Claude / AI Client
 - **Tool management** — register, edit, and delete `@register`-decorated tools in an agent's `tools.py` using AST-based parsing
 - **Filesystem access** — read, write, and edit files in agent workspaces with path traversal protection
 - **Prompt delivery** — send prompts to running agents and retrieve responses
-- **Scheduling** — schedule one-shot prompts with a delay or at a specific time (ISO 8601)
+- **Scheduling** — schedule, list, and cancel one-shot prompts with a delay or at a specific time (ISO 8601); schedules persist in a SQLite job store on the workspace volume and survive an MCP server restart
+- **Backup & migration** — export an agent workspace to a tarball and re-import it under a new name, on the same host or another (safe extraction, profile revalidated)
 - **Validation** — validate agent YAML profiles before applying them, and update a running agent's `agent.yaml` through a validate → apply → restart → rollback flow instead of a raw file write
 - **Logging** — tail Docker container logs per agent
 
@@ -46,6 +47,8 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_stop_agent` | write, idempotent | Stop agent container |
 | `miragen_delete_agent` | **destructive** | Stop, remove container, and delete workspace |
 | `miragen_get_agent_logs` | read-only | Tail Docker container logs (max 1000 lines) |
+| `miragen_export_agent` | write | Tar an agent workspace to `exports/` for backup/migration (excludes runs, history, caches) |
+| `miragen_import_agent` | write | Import an agent from an export tarball under a new name (safe extraction, validated) |
 | `miragen_list_tools` | read-only | List `@register` tools in agent's `tools.py` |
 | `miragen_get_tool_source` | read-only | Get source code of a specific tool |
 | `miragen_register_tool` | write | Append new tool to `tools.py` and update `agent.yaml` |
@@ -55,7 +58,9 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_write_agent_file` | **destructive** | Write/create a file in agent workspace |
 | `miragen_edit_agent_file` | **destructive** | String-replace edit a file in agent workspace |
 | `miragen_run_agent` | open-world | Send a prompt to agent's `/run` endpoint |
-| `miragen_set_retrigger` | open-world | Schedule a one-shot prompt (delay or absolute time) |
+| `miragen_set_retrigger` | open-world | Schedule a one-shot prompt (delay or absolute time); survives restarts |
+| `miragen_list_retriggers` | read-only | List scheduled retriggers (job id, agent, fire time, prompt preview); filter by agent |
+| `miragen_cancel_retrigger` | idempotent | Cancel a scheduled retrigger by job id |
 | `miragen_list_runs` | read-only | List an agent's run records, newest first (optional status filter) |
 | `miragen_get_run` | read-only | Full durable record for one run (status, usage, provenance, handles) |
 | `miragen_get_run_events` | read-only | Run event stream: tail read or cursor replay (`after`/`limit`) |
@@ -197,6 +202,8 @@ Append `_FILE` to any key variable to read from a Docker secret instead (e.g. `A
 ```
 $MIRAGEN_WORKSPACE/
 ├── compose.yml          ← managed by miragen-mcp
+├── retriggers.sqlite    ← persistent scheduled-retrigger store (APScheduler)
+├── exports/             ← agent export tarballs (miragen_export_agent)
 └── agents/
     ├── agent-a/
     │   ├── agent.yaml   ← Miragen profile
@@ -206,7 +213,25 @@ $MIRAGEN_WORKSPACE/
         └── tools.py
 ```
 
+Both `retriggers.sqlite` and `exports/` live on the mounted workspace volume, so scheduled retriggers and agent exports survive container restarts.
+
 Agent workspace directories are mounted to `/agent` inside each container, so filesystem changes made through the MCP tools are visible to the running agent immediately (tool changes trigger an automatic restart).
+
+### Backup, restore, and cloning
+
+`miragen_export_agent` tars an agent's workspace to `exports/<agent>-<timestamp>.tar.gz`, excluding `runs/`, `history.json`, `__pycache__/`, and any single file over 10 MB (skipped files are reported). The compose entry and secrets are **not** exported — an import regenerates them from the importing server's environment.
+
+`miragen_import_agent` extracts an export tarball under a new name, revalidates the profile, registers it in compose, and starts it. Extraction uses tarfile's `data` filter, so archives with absolute paths, `..` traversal, or links are rejected.
+
+```text
+# back up, then restore as a clone
+miragen_export_agent(agent="briefing")
+  → exports/briefing-20260723-120000.tar.gz
+miragen_import_agent(name="briefing-staging",
+                     archive_path="exports/briefing-20260723-120000.tar.gz")
+```
+
+The exported archive lives outside every agent workspace, so `miragen_read_agent_file` cannot fetch it; copy it off the host (or between hosts) yourself, then import it on the destination server.
 
 ## Authentication
 
@@ -222,6 +247,28 @@ pytest tests/
 ```
 
 Tests mock Docker, OAuth, and the scheduler — no running Docker daemon required.
+
+## Evaluations
+
+`evals/` measures whether an LLM can actually accomplish realistic, **read-only** tasks with these tools against a deterministic fixture workspace (`evals/fixtures/`, four agents with distinct modes, models, capabilities, approval globs, and tools). The fixtures are the ground truth: `evals/ground_truth.py` derives every expected answer from them.
+
+- **`evals/eval.xml`** — 10 questions, each with a single string-comparable answer and the read-only tools it relies on.
+- **`evals/check_evals.py`** — deterministic, no API key. Asserts every `eval.xml` answer still derives from the fixtures and that every referenced tool is read-only (source of truth: the `readOnlyHint` annotations in `server.py`). Runs in CI, and `tests/test_evals.py` additionally reproduces each answer by driving the real tools.
+
+  ```bash
+  python evals/check_evals.py
+  ```
+
+- **`evals/run_evals.py`** — the manual, paid LLM run. Drives an Anthropic model through the server's read-only tools (over FastMCP's in-memory transport) and prints a per-question pass/fail scorecard. Only read-only tools are exposed, so no eval can mutate state.
+
+  ```bash
+  pip install anthropic fastmcp
+  export ANTHROPIC_API_KEY=sk-...
+  python evals/run_evals.py                       # all questions
+  EVAL_MODEL=claude-haiku-4-5-20251001 python evals/run_evals.py --id cheapest-model
+  ```
+
+To add a question: extend the fixtures, add a branch to `ground_truth.compute_answers()`, then add an `<eval>` to `eval.xml` with the derived answer and the read-only tools it needs. `check_evals.py` will fail until the three agree.
 
 ## License
 

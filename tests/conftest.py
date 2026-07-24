@@ -49,6 +49,17 @@ sys.modules["apscheduler.schedulers"] = MagicMock()
 sys.modules["apscheduler.schedulers.asyncio"] = MagicMock()
 sys.modules["apscheduler.triggers"] = MagicMock()
 sys.modules["apscheduler.triggers.date"] = MagicMock()
+# The persistent job store pulls in apscheduler.jobstores.* and sqlalchemy, none
+# of which CI installs. JobLookupError must be a real exception class so
+# `except JobLookupError` in cancel_retrigger works against the mock.
+class _JobLookupError(Exception):
+    pass
+
+_jobstores_base = MagicMock()
+_jobstores_base.JobLookupError = _JobLookupError
+sys.modules["apscheduler.jobstores"] = MagicMock()
+sys.modules["apscheduler.jobstores.base"] = _jobstores_base
+sys.modules["apscheduler.jobstores.sqlalchemy"] = MagicMock()
 
 
 # ── origo ─────────────────────────────────────────────────────────────────────

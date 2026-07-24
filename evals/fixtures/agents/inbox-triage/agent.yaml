@@ -1,0 +1,15 @@
+name: inbox-triage
+mode: interactive
+spec:
+  model: anthropic/claude-sonnet-5
+  instructions: |
+    Sort incoming mail, summarize threads, and draft replies for review.
+capabilities:
+  - network
+approvals:
+  - "delete_*"
+  - "send_*"
+tools:
+  - summarize_inbox
+  - draft_reply
+  - delete_message

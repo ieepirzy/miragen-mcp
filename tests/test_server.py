@@ -324,6 +324,128 @@ def test_retrigger_past_datetime():
     assert "past" in result
 
 
+# ── set_retrigger job id + persistence knobs ──────────────────────────────────
+
+def test_retrigger_success_reports_job_id_and_grace(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.set_retrigger("worker", "do something", delay_seconds=60)
+
+    assert result.startswith("Retrigger scheduled")
+    assert "job_id: retrigger-worker-" in result
+    assert "miragen_cancel_retrigger" in result
+    # persistence knobs are passed through to APScheduler
+    _, kwargs = sched.add_job.call_args
+    assert kwargs["misfire_grace_time"] == server.RETRIGGER_MISFIRE_GRACE
+    assert kwargs["id"].startswith("retrigger-worker-")
+
+
+# ── _retrigger_agent parsing (hyphenated names) ───────────────────────────────
+
+@pytest.mark.parametrize("job_id,expected", [
+    ("retrigger-worker-1751450000", "worker"),
+    ("retrigger-my-hyphenated-agent-1751450000", "my-hyphenated-agent"),
+    ("retrigger-a_b-1751450000", "a_b"),
+    ("not-a-retrigger", None),
+    ("retrigger-worker", None),
+])
+def test_retrigger_agent_parsing(job_id, expected):
+    assert server._retrigger_agent(job_id) == expected
+
+
+# ── list_retriggers ───────────────────────────────────────────────────────────
+
+def _fake_job(job_id, args, next_run="2030-01-01T00:00:00+00:00"):
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    job = MagicMock()
+    job.id = job_id
+    job.args = args
+    job.next_run_time = datetime.fromisoformat(next_run) if next_run else None
+    return job
+
+
+def test_list_retriggers_all_and_preview(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.get_jobs.return_value = [
+        _fake_job("retrigger-worker-1751450000", ["worker", "hello world"]),
+        _fake_job("retrigger-scribe-1751460000", ["scribe", "x" * 500]),
+        _fake_job("some-other-job", ["irrelevant"]),  # not a retrigger, filtered out
+    ]
+    monkeypatch.setattr(server, "_scheduler", sched)
+
+    result = server.list_retriggers()
+    assert result["count"] == 2
+    ids = {r["job_id"] for r in result["retriggers"]}
+    assert ids == {"retrigger-worker-1751450000", "retrigger-scribe-1751460000"}
+    worker = next(r for r in result["retriggers"] if r["agent"] == "worker")
+    assert worker["prompt_preview"] == "hello world"
+    assert worker["fire_at"] == "2030-01-01T00:00:00+00:00"
+    scribe = next(r for r in result["retriggers"] if r["agent"] == "scribe")
+    assert len(scribe["prompt_preview"]) == 200
+
+
+def test_list_retriggers_filters_by_agent(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.get_jobs.return_value = [
+        _fake_job("retrigger-worker-1751450000", ["worker", "a"]),
+        _fake_job("retrigger-worker2-1751460000", ["worker2", "b"]),
+    ]
+    monkeypatch.setattr(server, "_scheduler", sched)
+
+    result = server.list_retriggers(agent="worker")
+    # prefix "retrigger-worker-" must not also match "retrigger-worker2-"
+    assert result["count"] == 1
+    assert result["retriggers"][0]["agent"] == "worker"
+
+
+def test_list_retriggers_invalid_agent():
+    result = server.list_retriggers(agent="Bad Name!")
+    assert result["error"].startswith("ERROR: invalid agent name")
+
+
+def test_list_retriggers_handles_paused_job(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.get_jobs.return_value = [
+        _fake_job("retrigger-worker-1751450000", ["worker", "a"], next_run=None),
+    ]
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.list_retriggers()
+    assert result["retriggers"][0]["fire_at"] is None
+
+
+# ── cancel_retrigger ──────────────────────────────────────────────────────────
+
+def test_cancel_retrigger_success(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.cancel_retrigger("retrigger-worker-1751450000")
+    assert result == "Retrigger 'retrigger-worker-1751450000' cancelled."
+    sched.remove_job.assert_called_once_with("retrigger-worker-1751450000")
+
+
+def test_cancel_retrigger_unknown_id(monkeypatch):
+    from unittest.mock import MagicMock
+
+    sched = MagicMock()
+    sched.remove_job.side_effect = server.JobLookupError("nope")
+    monkeypatch.setattr(server, "_scheduler", sched)
+    result = server.cancel_retrigger("retrigger-worker-000")
+    assert result.startswith("ERROR: no retrigger")
+    assert "miragen_list_retriggers" in result
+
+
 # ── delete_tool ───────────────────────────────────────────────────────────────
 
 def test_delete_tool_removes_function_and_yaml_entry(tmp_path, monkeypatch):
@@ -801,3 +923,234 @@ def test_compose_service_omits_token_when_unset(tmp_path, monkeypatch):
 
     env = server._read_yaml(tmp_path / "compose.yml")["services"]["worker"]["environment"]
     assert "MIRAGEN_INTERNAL_TOKEN" not in env
+
+
+# ── export / import agent (issue #6) ──────────────────────────────────────────
+
+import io
+import tarfile
+
+
+def _make_agent(agents_dir, name, *, with_extras=True):
+    d = agents_dir / name
+    d.mkdir(parents=True)
+    (d / "agent.yaml").write_text(f"name: {name}\nmode: autonomous\ntools: []\n")
+    (d / "tools.py").write_text("from miragen import register\n")
+    if with_extras:
+        (d / "runs").mkdir()
+        (d / "runs" / "run1.json").write_text('{"id": 1}')
+        (d / "history.json").write_text("[]")
+        pyc = d / "__pycache__"
+        pyc.mkdir()
+        (pyc / "x.pyc").write_text("junk")
+        data = d / "data"
+        data.mkdir()
+        (data / "notes.md").write_text("# notes")
+    return d
+
+
+def _archive_members(path):
+    with tarfile.open(path, "r:gz") as tar:
+        return sorted(m.name for m in tar.getmembers())
+
+
+def test_export_agent_excludes_runs_history_pycache(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    _make_agent(tmp_path / "agents", "worker")
+
+    result = server.export_agent("worker")
+    assert "error" not in result, result
+    assert result["agent"] == "worker"
+    assert result["included"] == ["agent.yaml", "data/notes.md", "tools.py"]
+
+    members = _archive_members(result["archive_path"])
+    assert "worker/agent.yaml" in members
+    assert "worker/data/notes.md" in members
+    assert not any("runs/" in m for m in members)
+    assert not any("history.json" in m for m in members)
+    assert not any("__pycache__" in m for m in members)
+
+
+def test_export_agent_skips_large_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "MAX_EXPORT_FILE_BYTES", 16)
+    d = _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    (d / "big.bin").write_bytes(b"x" * 64)
+
+    result = server.export_agent("worker")
+    assert "big.bin" not in result["included"]
+    assert any(s["path"] == "big.bin" and "10 MB" in s["reason"] for s in result["skipped"])
+
+
+def test_export_agent_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    result = server.export_agent("ghost")
+    assert result["error"].startswith("ERROR: agent 'ghost' not found")
+
+
+def test_export_agent_invalid_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    result = server.export_agent("Bad Name!")
+    assert result["error"].startswith("ERROR: invalid agent name")
+
+
+def test_export_agent_refuses_oversized_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "MAX_ARCHIVE_BYTES", 1)  # anything real exceeds 1 byte
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    result = server.export_agent("worker")
+    assert result["error"].startswith("ERROR: export archive would be")
+    # the oversized archive is cleaned up
+    assert list((tmp_path / "exports").glob("*.tar.gz")) == []
+
+
+def _ok_proc(*a, **k):
+    from unittest.mock import MagicMock
+
+    return MagicMock(returncode=0, stdout="", stderr="")
+
+
+def test_import_round_trips_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
+    monkeypatch.setattr(server.subprocess, "run", _ok_proc)
+    _make_agent(tmp_path / "agents", "worker")
+
+    export = server.export_agent("worker")
+    # simulate deletion of the source workspace, then import under a new name
+    import shutil as _shutil
+
+    _shutil.rmtree(tmp_path / "agents" / "worker")
+
+    result = server.import_agent("worker-copy", export["archive_path"])
+    assert result.startswith("Agent worker-copy imported"), result
+
+    d = tmp_path / "agents" / "worker-copy"
+    assert (d / "tools.py").read_text() == "from miragen import register\n"
+    yaml_text = (d / "agent.yaml").read_text()
+    assert "name: worker-copy" in yaml_text
+    assert "name: worker\n" not in yaml_text
+    # runs/history/pycache were never in the archive
+    assert not (d / "runs").exists()
+    assert not (d / "history.json").exists()
+
+
+def test_import_accepts_relative_exports_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
+    monkeypatch.setattr(server.subprocess, "run", _ok_proc)
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    export = server.export_agent("worker")
+    fname = pytest.importorskip("pathlib").Path(export["archive_path"]).name
+
+    result = server.import_agent("copy", f"exports/{fname}", start=False)
+    assert result.startswith("Agent copy imported")
+    assert "not started" in result
+
+
+def test_import_rejects_existing_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    result = server.import_agent("worker", "exports/whatever.tar.gz")
+    assert result.startswith("ERROR: agent 'worker' already exists")
+
+
+def test_import_rejects_path_outside_exports(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    for bad in ["/etc/passwd", "../secrets.tar.gz", "exports/../evil.tar.gz"]:
+        result = server.import_agent("copy", bad)
+        assert result.startswith("ERROR")
+
+
+def test_import_missing_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    result = server.import_agent("copy", "exports/nope.tar.gz")
+    assert result.startswith("ERROR: archive not found")
+
+
+def _write_tar(path, members):
+    """members: list of (name, bytes|None). None => craft a raw TarInfo (for
+    malicious names tarfile.add would sanitize)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w:gz") as tar:
+        for name, content in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+
+
+def test_import_rejects_traversal_archive(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    archive = tmp_path / "exports" / "evil.tar.gz"
+    _write_tar(archive, [
+        ("copy/agent.yaml", b"name: copy\n"),
+        ("../evil.txt", b"pwned"),
+    ])
+    result = server.import_agent("copy", "exports/evil.tar.gz")
+    assert result.startswith("ERROR: could not safely extract")
+    assert not (tmp_path / "agents" / "copy").exists()
+    # no stray traversal file landed next to exports/
+    assert not (tmp_path / "evil.txt").exists()
+
+
+def test_import_neutralizes_absolute_path_archive(tmp_path, monkeypatch):
+    # tarfile's "data" filter strips leading slashes rather than raising, so an
+    # absolute member is neutralized to a path *inside* the staging dir and never
+    # escapes. Here it lands as staging/opt/evil.txt (no agent.yaml at root), so the
+    # import is still rejected and nothing is written to the real /opt/evil.txt.
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    escape_target = tmp_path / "opt" / "evil.txt"
+    archive = tmp_path / "exports" / "abs.tar.gz"
+    _write_tar(archive, [(str(escape_target), b"pwned")])
+    result = server.import_agent("copy", "exports/abs.tar.gz")
+    assert result.startswith("ERROR")
+    assert not (tmp_path / "agents" / "copy").exists()
+    assert not escape_target.exists()  # the absolute path did not escape staging
+
+
+def test_import_rolls_back_on_validation_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    add_called = []
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: add_called.append(name))
+    monkeypatch.setattr(
+        server.subprocess, "run",
+        lambda *a, **k: __import__("unittest").mock.MagicMock(returncode=1, stdout="bad schema", stderr=""),
+    )
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    export = server.export_agent("worker")
+
+    result = server.import_agent("copy", export["archive_path"])
+    assert result.startswith("ERROR: imported profile failed validation")
+    assert not (tmp_path / "agents" / "copy").exists()
+    assert add_called == []  # never registered in compose
+
+
+def test_import_rolls_back_on_start_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+    removed = []
+    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
+    monkeypatch.setattr(server, "_compose_remove_service", lambda name: removed.append(name))
+
+    calls = {"n": 0}
+
+    def run(*a, **k):
+        from unittest.mock import MagicMock
+
+        calls["n"] += 1
+        if calls["n"] == 1:  # validate
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return MagicMock(returncode=1, stdout="", stderr="boom")  # docker compose up
+
+    monkeypatch.setattr(server.subprocess, "run", run)
+    _make_agent(tmp_path / "agents", "worker", with_extras=False)
+    export = server.export_agent("worker")
+
+    result = server.import_agent("copy", export["archive_path"])
+    assert result.startswith("ERROR: agent imported but container failed to start")
+    assert not (tmp_path / "agents" / "copy").exists()
+    assert removed == ["copy"]

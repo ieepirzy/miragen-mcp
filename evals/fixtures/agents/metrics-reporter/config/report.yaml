@@ -1,0 +1,4 @@
+schedule: daily
+format: pdf
+recipients:
+  - ops@example.com
