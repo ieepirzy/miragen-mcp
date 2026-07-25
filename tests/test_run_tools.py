@@ -257,3 +257,187 @@ def test_get_doc_404_names_the_readme(monkeypatch):
     monkeypatch.setattr(server, "_doc_cache", {})
     result = server.get_miragen_doc("docs/nope.md")
     assert result.startswith("ERROR:") and "does not exist" in result
+
+
+# ── async runs & approvals (miragen issue #3 / miragen #5, #6) ───────────────
+
+
+def test_run_agent_appends_run_id_when_present(monkeypatch):
+    def handler(request):
+        return _json_response({"output": "hello back", "run_id": "abc123"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent("worker", "hi"))
+    assert result.startswith("hello back")
+    assert result.endswith("(run_id: abc123)")
+
+
+def test_run_agent_no_run_id_note_when_absent(monkeypatch):
+    def handler(request):
+        return _json_response({"output": "hello back"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent("worker", "hi"))
+    assert result == "hello back"
+    assert "run_id" not in result
+
+
+def test_run_agent_async_success_message(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(202, json={"run_id": "abc123", "status": "running"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "do the thing"))
+    assert seen["path"] == "/run/async"
+    assert seen["body"] == {"prompt": "do the thing"}
+    assert "abc123" in result
+    assert "miragen_get_run" in result
+    assert "worker" in result
+
+
+def test_run_agent_async_missing_run_id_is_an_error(monkeypatch):
+    def handler(request):
+        return _json_response({"status": "running"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "do the thing"))
+    assert result.startswith("ERROR:")
+    assert "no run_id" in result
+
+
+def test_run_agent_async_connect_error(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "hi"))
+    assert result.startswith("ERROR: could not connect to agent 'worker'")
+    assert "miragen_start_agent" in result
+
+
+def test_run_agent_async_timeout_error(monkeypatch):
+    def handler(request):
+        raise httpx.TimeoutException("slow")
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "hi"))
+    assert result.startswith("ERROR: agent 'worker' did not respond")
+    assert "miragen_get_agent_logs" in result
+
+
+def test_run_agent_async_degrades_on_404(monkeypatch):
+    def handler(request):
+        return httpx.Response(404, json={"detail": "not found"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "hi"))
+    assert result.startswith("ERROR: agent 'worker' is running a miragen image without")
+    assert "run-record/approval" in result
+    assert "miragen_delete_agent + miragen_create_agent" in result
+
+
+def test_run_agent_async_degrades_on_405(monkeypatch):
+    def handler(request):
+        return httpx.Response(405, json={"detail": "method not allowed"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "hi"))
+    assert "without run-record/approval support" in result
+
+
+def test_run_agent_async_other_http_error_not_degraded(monkeypatch):
+    def handler(request):
+        return httpx.Response(500, json={"detail": "boom"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.run_agent_async("worker", "hi"))
+    assert "HTTP 500" in result
+    assert "without run-record/approval support" not in result
+
+
+def test_list_pending_approvals_returns_body(monkeypatch):
+    def handler(request):
+        assert request.url.path == "/approvals"
+        return _json_response({
+            "count": 1,
+            "approvals": [
+                {
+                    "request_id": "req-1",
+                    "request": {"tool_name": "delete_thread", "tool_args": {"id": 42}},
+                    "created_at": "2026-07-25T00:00:00Z",
+                    "expires_at": "2026-07-25T00:05:00Z",
+                }
+            ],
+        })
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.list_pending_approvals("worker"))
+    assert result["count"] == 1
+    assert result["approvals"][0]["request_id"] == "req-1"
+
+
+def test_list_pending_approvals_invalid_agent_name(monkeypatch):
+    result = asyncio.run(server.list_pending_approvals("Bad Name!"))
+    assert result["error"].startswith("ERROR: invalid agent name")
+
+
+def test_list_pending_approvals_degrades_on_404(monkeypatch):
+    def handler(request):
+        return httpx.Response(404, json={"detail": "not found"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.list_pending_approvals("worker"))
+    assert "without run-record/approval support" in result["error"]
+
+
+def test_resolve_approval_round_trips_note_as_prompt(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return _json_response({"resolved": True, "request_id": "req-1"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(
+        server.resolve_approval("worker", "req-1", True, note="looks safe, go ahead")
+    )
+    assert seen["path"] == "/approvals/req-1"
+    assert seen["body"] == {"approved": True, "prompt": "looks safe, go ahead"}
+    assert result["resolved"] is True
+
+
+def test_resolve_approval_denied_without_note(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return _json_response({"resolved": True, "request_id": "req-1"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    asyncio.run(server.resolve_approval("worker", "req-1", False))
+    assert seen["body"] == {"approved": False, "prompt": None}
+
+
+def test_resolve_approval_404_maps_to_degradation_message(monkeypatch):
+    # Per the design doc, POST /approvals/{id} also returns 404 for a legitimate
+    # "unknown, already resolved, or expired" request_id on an up-to-date agent —
+    # indistinguishable at the transport level from "old image, route doesn't exist"
+    # without inspecting response-body shape, which the spec doesn't call for. The
+    # degradation message wins for any 404/405 on this path; a human reading it can
+    # still tell the two apart from context (agent otherwise responsive vs not).
+    def handler(request):
+        return httpx.Response(404, json={"error": "unknown, already resolved, or expired"})
+
+    monkeypatch.setattr(server, "_agent_transport", _transport(handler))
+    result = asyncio.run(server.resolve_approval("worker", "req-missing", True))
+    assert "without run-record/approval support" in result["error"]
+
+
+def test_resolve_approval_invalid_agent_name(monkeypatch):
+    result = asyncio.run(server.resolve_approval("Bad Name!", "req-1", True))
+    assert result["error"].startswith("ERROR: invalid agent name")
