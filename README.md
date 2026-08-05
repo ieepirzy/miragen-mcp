@@ -4,22 +4,37 @@ An MCP (Model Context Protocol) server for managing [Miragen](https://github.com
 
 ## Overview
 
-miragen-mcp acts as an orchestration layer over Docker. Each Miragen agent runs in its own container within a shared `miragen-net` bridge network. The MCP server manages the central `compose.yml`, agent workspaces on the host filesystem, and communicates with running agents over HTTP.
+miragen-mcp is a **thin MCP adapter** over the swarm's management plane. The
+Docker socket, the workspace (`compose.yml`, `agents/`), and all lifecycle
+state belong to **miragend** — the lifecycle daemon that ships in the
+[miragen](https://github.com/ieepirzy/miragen) repo (`pip install
+miragen[daemon]`, image `ghcr.io/ieepirzy/miragend`). This server translates
+MCP tool calls from AI clients into miragend's HTTP API, and talks to the
+agents directly (over `miragen-net`) only for run/approval traffic.
 
 ```
-Claude / AI Client
-       │  MCP (OAuth2)
-       ▼
- miragen-mcp server
-       │  Docker socket + HTTP
-       ▼
- ┌──────────────────────────────┐
- │        miragen-net           │
- │  ┌──────────┐ ┌──────────┐  │
- │  │ agent-a  │ │ agent-b  │  │
- │  └──────────┘ └──────────┘  │
+Claude / AI Client            mirarun (control plane)
+       │  MCP (OAuth2)               │  HTTP (bearer token)
+       ▼                             │
+ miragen-mcp ──────────┐             │
+   │ HTTP              │ HTTP        │
+   │ (runs/approvals)  ▼             ▼
+   │                 miragend ◄──────┘
+   │                   │  Docker socket + workspace
+ ┌─┴───────────────────┴────────┐
+ │          miragen-net         │
+ │   ┌──────────┐ ┌──────────┐  │
+ │   │ agent-a  │ │ agent-b  │  │
+ │   └──────────┘ └──────────┘  │
  └──────────────────────────────┘
 ```
+
+The split is a security boundary: this container is the OAuth-fronted,
+internet-adjacent one, and it holds **no** Docker socket, no workspace mount,
+and no persistent state — compromising it no longer means owning the host.
+Swarm membership is likewise trustworthy by construction: the registry is
+derived from state only miragend maintains, so agents can neither announce
+themselves nor discover peers.
 
 ## Features
 
@@ -71,7 +86,7 @@ All tools carry a `miragen_` prefix so they stay unambiguous alongside other MCP
 | `miragen_list_pending_approvals` | read-only | List an agent's pending gated tool-call approval requests |
 | `miragen_resolve_approval` | write | Approve or deny a pending gated tool call (see [Observability & approvals](#observability--approvals) for the prompt-injection warning) |
 | `miragen_check_deployment` | read-only | Deployed miragen version/capabilities vs what this server supports |
-| `miragen_validate_yaml` | read-only | Validate agent YAML using miragen CLI |
+| `miragen_validate_yaml` | read-only | Validate agent YAML via the miragend daemon |
 | `miragen_get_readme` | read-only | Fetch latest Miragen README from GitHub |
 | `miragen_get_doc` | read-only | Fetch a linked secondary doc (`docs/**.md`) from the miragen repo |
 
@@ -82,8 +97,8 @@ Input guardrails: agent names must match `[a-z0-9][a-z0-9_-]{0,62}` (they double
 Alongside tools, the server exposes read-only **MCP resources** for clients that browse
 context instead of (or in addition to) calling tools, and one **MCP prompt** to bootstrap
 new agents. Unlike tools — which return `"ERROR: ..."` strings — resources raise on
-failure (`ValueError` for an invalid or unknown agent name, `FileNotFoundError` if the
-agent exists but the specific file doesn't), matching FastMCP's convention for resources.
+failure (`ValueError`, carrying the daemon's explanation of what was invalid or
+missing), matching FastMCP's convention for resources.
 
 | Resource | MIME type | Description |
 |----------|-----------|--------------|
@@ -98,9 +113,12 @@ agent exists but the specific file doesn't), matching FastMCP's convention for r
 
 ## Requirements
 
-- Docker with the Compose plugin
+- A running miragend daemon (`ghcr.io/ieepirzy/miragend` — included as a
+  service in this repo's `compose.yml`)
 - Python 3.12 (or use the provided Docker image)
-- Access to the Docker socket
+
+No Docker socket access and no Compose plugin are needed by this container —
+those requirements moved to miragend.
 
 ## Installation
 
@@ -111,23 +129,25 @@ Two environments run this service and need **opposite** ingress shapes. One
 second file, because Portainer locks a git-stack's Compose path at creation and
 gives no way to layer a second file onto a stack that already exists:
 
+The stack now has two services: `miragend` (profile-independent — both shapes
+need it) and the MCP adapter (profile-gated ingress).
+
 ```bash
 # VPS: NPM runs on the same host, reached by container-name DNS over a shared
 # `proxy` network (which NPM's own stack must already have created).
-DOCKER_GID=$(getent group docker | cut -d: -f3) \
-  COMPOSE_PROFILES=vps docker compose up -d --build
+COMPOSE_PROFILES=vps docker compose up -d --build
 
 # homelab (or anywhere the reverse proxy is on a different machine): published
 # on loopback plus BOUND_IP, which should be this host's WireGuard address.
-DOCKER_GID=$(getent group docker | cut -d: -f3) BOUND_IP=10.x.x.x \
-  COMPOSE_PROFILES=homelab docker compose up -d --build
+BOUND_IP=10.x.x.x COMPOSE_PROFILES=homelab docker compose up -d --build
 ```
 
 In Portainer, set `COMPOSE_PROFILES` (`vps` or `homelab`) as a stack environment
-variable — that's editable at any time, unlike the Compose path. `DOCKER_GID` is
-always required — it must match `getent group docker | cut -d: -f3` **on the
-deployment host**, not wherever you're reading this from, or the container
-cannot reach `/var/run/docker.sock`.
+variable — that's editable at any time, unlike the Compose path. `DOCKER_GID`
+is gone: miragend detects the docker socket's group at runtime, so nothing
+host-specific needs to be configured for socket access anymore. Set
+`MIRAGEND_TOKEN` (shared by both services) so the lifecycle API is not relying
+on network isolation alone.
 
 > **Do not make `BOUND_IP` a required var (`:?`) in compose.yml.** Compose
 > interpolates every service block in the file up front regardless of which
@@ -145,17 +165,28 @@ cannot reach `/var/run/docker.sock`.
 > lost `miragen-mcp:8000` — a live 502 until this was split into two
 > profile-gated services in the same file.
 
-### Docker (single container, no ingress split)
+### Docker (single containers, no ingress split)
 
 ```bash
-docker build --build-arg DOCKER_GID=$(getent group docker | cut -d: -f3) -t miragen-mcp .
+# the daemon: socket + workspace + API keys
 docker run -d \
-  --name miragen-mcp \
+  --name miragend \
+  --network miragen-net \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /opt/miragen:/opt/miragen \
+  -e MIRAGEND_TOKEN=your-daemon-token \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  ghcr.io/ieepirzy/miragend:latest
+
+# the MCP adapter: OAuth + HTTP only
+docker build -t miragen-mcp .
+docker run -d \
+  --name miragen-mcp \
+  --network miragen-net \
+  -e MIRAGEND_URL=http://miragend:8000 \
+  -e MIRAGEND_TOKEN=your-daemon-token \
   -e MCP_BASE_URL=https://your-domain.example.com \
   -e MCP_CLIENT_SECRET=your-secret \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
   -p 127.0.0.1:8000:8000 \
   miragen-mcp
 ```
@@ -174,10 +205,12 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 
 ## Configuration
 
+**This server (miragen-mcp):**
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIRAGEN_WORKSPACE` | `/opt/miragen` | Root workspace directory on the host |
-| `MIRAGEN_BASE_IMAGE` | `ghcr.io/ieepirzy/miragen:latest` | Docker image used for new agent containers |
+| `MIRAGEND_URL` | `http://miragend:8000` | The miragend lifecycle daemon's HTTP API |
+| `MIRAGEND_TOKEN` | *(empty)* | Bearer token for the daemon API — must equal the daemon's own `MIRAGEND_TOKEN` |
 | `MIRAGEN_INTERNAL_TOKEN` | *(empty)* | Sent as `X-Miragen-Token` on calls to the agents' HTTP control APIs — set it to the same value the agent containers use, if they enforce one |
 | `MCP_BASE_URL` | *(required)* | Public base URL of this server — used for OAuth |
 | `MCP_CLIENT_ID` | `miragen-mcp` | OAuth client ID |
@@ -185,7 +218,17 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 | `MCP_NO_AUTH` | `false` | Disable OAuth entirely (local development only) |
 | `MCP_ALLOW_DEFAULT_SECRET` | `false` | Explicitly acknowledge and allow starting with the default `changeme` secret while auth is enabled (not recommended) |
 
-**LLM provider keys** (pass at least one):
+**The daemon (miragend service in `compose.yml`):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MIRAGEN_WORKSPACE` | `/opt/miragen` | Root workspace directory on the host |
+| `MIRAGEN_BASE_IMAGE` | `ghcr.io/ieepirzy/miragen:latest` | Docker image used for new agent containers |
+| `MIRAGEND_TOKEN` | *(empty)* | Bearer token guarding the daemon's API (empty = network isolation only) |
+| `MIRAGEN_INTERNAL_TOKEN` | *(empty)* | Written into created agents' compose entries so their `/run*` guard is armed |
+
+**LLM provider keys** (on the **miragend** service — the daemon writes them
+into created agents' compose entries; the MCP adapter never sees a model key):
 
 | Variable | Notes |
 |----------|-------|
@@ -198,13 +241,13 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 | `GROQ_API_KEY` | |
 | `COHERE_API_KEY` | |
 
-Append `_FILE` to any key variable to read from a Docker secret instead (e.g. `ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key`).
+Append `_FILE` to any key variable to read from a Docker secret instead (e.g. `ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key`) — see `compose.secrets.yml`.
 
 ## Workspace Layout
 
 ```
-$MIRAGEN_WORKSPACE/
-├── compose.yml          ← managed by miragen-mcp
+$MIRAGEN_WORKSPACE/          (mounted into miragend only)
+├── compose.yml          ← managed by miragend
 ├── retriggers.sqlite    ← persistent scheduled-retrigger store (APScheduler)
 ├── exports/             ← agent export tarballs (miragen_export_agent)
 └── agents/
@@ -216,13 +259,15 @@ $MIRAGEN_WORKSPACE/
         └── tools.py
 ```
 
-Both `retriggers.sqlite` and `exports/` live on the mounted workspace volume, so scheduled retriggers and agent exports survive container restarts.
+The workspace is the daemon's volume; this MCP server holds no state at all.
+`retriggers.sqlite` and `exports/` live there, so scheduled retriggers and
+agent exports survive restarts of either container.
 
 Agent workspace directories are mounted to `/agent` inside each container, so filesystem changes made through the MCP tools are visible to the running agent immediately (tool changes trigger an automatic restart).
 
 ### Backup, restore, and cloning
 
-`miragen_export_agent` tars an agent's workspace to `exports/<agent>-<timestamp>.tar.gz`, excluding `runs/`, `history.json`, `__pycache__/`, and any single file over 10 MB (skipped files are reported). The compose entry and secrets are **not** exported — an import regenerates them from the importing server's environment.
+`miragen_export_agent` tars an agent's workspace to `exports/<agent>-<timestamp>.tar.gz`, excluding `runs/`, `history.json`, `__pycache__/`, and any single file over 10 MB (skipped files are reported). The compose entry and secrets are **not** exported — an import regenerates them from the daemon's environment.
 
 `miragen_import_agent` extracts an export tarball under a new name, revalidates the profile, registers it in compose, and starts it. Extraction uses tarfile's `data` filter, so archives with absolute paths, `..` traversal, or links are rejected.
 
