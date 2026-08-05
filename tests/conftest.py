@@ -1,7 +1,13 @@
 """
-Stubs for heavy deps that have side-effects at import time (docker socket,
-OAuth provider, FastMCP HTTP app). Must be in conftest.py so they are
-installed into sys.modules before server.py is first imported by any test.
+Stubs for heavy deps that have side-effects at import time (OAuth provider,
+FastMCP HTTP app). Must be in conftest.py so they are installed into
+sys.modules before server.py is first imported by any test.
+
+The docker/apscheduler stubs that used to live here are gone with the
+lifecycle extraction: server.py no longer imports either — everything that
+touched the Docker socket or the scheduler now lives in the miragend daemon
+(miragen repo), and server.py only speaks HTTP to it (mocked per-test via
+the server._daemon_transport seam).
 """
 import os
 import sys
@@ -24,42 +30,6 @@ _starlette_routing.Route = MagicMock(side_effect=lambda path, endpoint, **kw: (p
 sys.modules.setdefault("starlette", MagicMock())
 sys.modules.setdefault("starlette.routing", _starlette_routing)
 sys.modules.setdefault("starlette.applications", MagicMock())
-
-
-# ── docker ───────────────────────────────────────────────────────────────────
-
-class _NotFound(Exception):
-    pass
-
-_docker_errors = MagicMock()
-_docker_errors.NotFound = _NotFound
-
-_docker_mod = MagicMock()
-_docker_mod.from_env.return_value = MagicMock()
-_docker_mod.errors = _docker_errors
-
-sys.modules["docker"] = _docker_mod
-sys.modules["docker.errors"] = _docker_errors
-
-
-# ── apscheduler ──────────────────────────────────────────────────────────────
-
-sys.modules["apscheduler"] = MagicMock()
-sys.modules["apscheduler.schedulers"] = MagicMock()
-sys.modules["apscheduler.schedulers.asyncio"] = MagicMock()
-sys.modules["apscheduler.triggers"] = MagicMock()
-sys.modules["apscheduler.triggers.date"] = MagicMock()
-# The persistent job store pulls in apscheduler.jobstores.* and sqlalchemy, none
-# of which CI installs. JobLookupError must be a real exception class so
-# `except JobLookupError` in cancel_retrigger works against the mock.
-class _JobLookupError(Exception):
-    pass
-
-_jobstores_base = MagicMock()
-_jobstores_base.JobLookupError = _JobLookupError
-sys.modules["apscheduler.jobstores"] = MagicMock()
-sys.modules["apscheduler.jobstores.base"] = _jobstores_base
-sys.modules["apscheduler.jobstores.sqlalchemy"] = MagicMock()
 
 
 # ── origo ─────────────────────────────────────────────────────────────────────

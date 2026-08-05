@@ -1,25 +1,21 @@
-FROM docker:27-cli AS docker-cli
+# Thin MCP adapter: no docker CLI, no compose plugin, no socket group, no
+# workspace volume. All of that moved to the miragend daemon (miragen repo,
+# Dockerfile.miragend); this container only speaks HTTP — to miragend for
+# lifecycle, to the agents for run/approval traffic.
 
 FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
-COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
-
-ARG DOCKER_GID=988
-
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt \
-    && apt-get update && apt-get install -y --no-install-recommends gosu \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g "${DOCKER_GID}" docker \
-    && adduser --disabled-password --gecos "" mcpuser \
-    && usermod -aG docker mcpuser
+    && adduser --disabled-password --gecos "" mcpuser
 
-COPY entrypoint.sh server.py ./
-RUN chmod +x entrypoint.sh
+COPY server.py ./
+
+USER mcpuser
 
 EXPOSE 8000
-ENTRYPOINT ["./entrypoint.sh"]
+
+CMD ["python", "/app/server.py"]

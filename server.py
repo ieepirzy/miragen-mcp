@@ -1,27 +1,13 @@
-import ast
 import logging
 import os
 import re
-import shutil
-import subprocess
-import tarfile
-import tempfile
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Annotated
 
 logger = logging.getLogger(__name__)
 
 import uvicorn
 
-import docker
 import httpx
-import yaml
-from apscheduler.jobstores.base import JobLookupError
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.date import DateTrigger
 from fastmcp import FastMCP
 from origo import OAuthMiddleware, OAuthProvider
 from pydantic import Field
@@ -29,10 +15,18 @@ from pydantic import Field
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+#
+# This server is a thin MCP adapter over two HTTP surfaces:
+#
+#   miragend (MIRAGEND_URL)      — the swarm lifecycle daemon in the miragen
+#     repo. It alone holds the Docker socket and the workspace volume; every
+#     lifecycle/tool/file/schedule tool here delegates to it. This container
+#     needs NO docker socket, NO workspace mount, and NO DOCKER_GID.
+#
+#   the agents themselves        — reached directly on miragen-net by
+#     container-name DNS for run/approval traffic (X-Miragen-Token auth),
+#     exactly as before the daemon existed.
 
-WORKSPACE = Path(os.getenv("MIRAGEN_WORKSPACE", "/opt/miragen"))
-AGENTS_DIR = WORKSPACE / "agents"
-COMPOSE_FILE = WORKSPACE / "compose.yml"
 BASE_URL = os.getenv("MCP_BASE_URL")
 CLIENT_ID = os.getenv("MCP_CLIENT_ID", "miragen-mcp")
 CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "changeme")
@@ -40,7 +34,10 @@ AUTO_APPROVE = os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true"
 PUBLIC_REGISTRATION = os.getenv("MCP_PUBLIC_REGISTRATION", "false").lower() == "true"
 NO_AUTH = os.getenv("MCP_NO_AUTH", "false").lower() == "true"
 MCP_PATH = os.getenv("MCP_PATH", "/mcp")
-MIRAGEN_BASE_IMAGE = os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest")
+
+# The lifecycle daemon. Default resolves by container-name DNS on miragen-net.
+MIRAGEND_URL = os.getenv("MIRAGEND_URL", "http://miragend:8000").rstrip("/")
+MIRAGEND_TOKEN = os.getenv("MIRAGEND_TOKEN", "")
 
 # Internal token for the agents' HTTP control APIs. When the agent containers
 # set MIRAGEN_INTERNAL_TOKEN, set the same value on this server so its calls
@@ -63,54 +60,16 @@ SUPPORTED_CONTRACT_CAPABILITIES = frozenset({
 # context window.
 MAX_OUTPUT_CHARS = 50_000
 
-# Agent export/import (miragen_export_agent / miragen_import_agent). Exports are
-# tarballs of an agent workspace, excluding run history and caches; imports must
-# come from the workspace exports/ directory and extract with tarfile's "data"
-# filter (rejects absolute paths, traversal, and links).
-EXPORT_EXCLUDE_DIRS = frozenset({"runs", "__pycache__"})
-EXPORT_EXCLUDE_FILES = frozenset({"history.json"})
-MAX_EXPORT_FILE_BYTES = 10 * 1024 * 1024  # skip individual files larger than this
-MAX_ARCHIVE_BYTES = 50 * 1024 * 1024  # refuse to produce an archive larger than this
-
 # Agent names double as directory names, compose service names, and Docker
 # container names — restrict them accordingly (also blocks path traversal).
+# The daemon enforces this too; checking here keeps the round trip out of the
+# obvious mistakes and lets error messages name the right follow-up tool.
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 _AGENT_NAME_RE = re.compile(AGENT_NAME_PATTERN)
 
 # ---------------------------------------------------------------------------
-# Shared state
-# ---------------------------------------------------------------------------
-
-_docker = docker.from_env()
-
-# Retrigger schedules persist across restarts in a SQLite job store on the
-# mounted workspace volume (not the default in-memory store, which drops every
-# scheduled prompt when this container restarts). SQLAlchemyJobStore pickles the
-# job callable *by reference*, so `_fire_trigger` MUST stay a module-level
-# function in this module — do not nest it or turn it into a closure/lambda, or
-# unpickling on restart will fail.
-RETRIGGER_DB_PATH = WORKSPACE / "retriggers.sqlite"
-_scheduler = AsyncIOScheduler(
-    jobstores={"default": SQLAlchemyJobStore(url=f"sqlite:///{RETRIGGER_DB_PATH}")}
-)
-
-# Grace period for retriggers whose fire time passed while this server was down:
-# on restart within this many seconds of the missed fire time the job still
-# runs; older misses are dropped (APScheduler default behaviour).
-RETRIGGER_MISFIRE_GRACE = 3600
-
-# Scheduled retrigger job ids are "retrigger-<agent>-<unix_ts>". Agent names may
-# contain hyphens, so parse the agent as everything between the fixed prefix and
-# the trailing "-<digits>" timestamp.
-_RETRIGGER_ID_RE = re.compile(r"^retrigger-(?P<agent>.+)-\d+$")
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _agent_dir(name: str) -> Path:
-    return AGENTS_DIR / name
 
 
 def _check_agent_name(name: str) -> str | None:
@@ -133,47 +92,113 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     )
 
 
-def _safe_path(agent: str, rel: str) -> tuple[Path | None, str | None]:
-    """Resolve a relative path inside an agent workspace and guard against traversal."""
-    if ".." in rel:
-        return None, "ERROR: path traversal not allowed"
-    p = Path(rel)
-    if p.is_absolute():
-        return None, "ERROR: path traversal not allowed"
-    base = _agent_dir(agent).resolve()
-    full = (base / p).resolve()
-    if not str(full).startswith(str(base) + os.sep) and full != base:
-        return None, "ERROR: path traversal not allowed"
-    return full, None
+# ---------------------------------------------------------------------------
+# Daemon client
+# ---------------------------------------------------------------------------
+
+# Test seam: when set (httpx.MockTransport in tests), daemon HTTP calls route
+# through it instead of the docker network.
+_daemon_transport = None
+
+# Follow-up guidance appended to daemon errors, keyed by the daemon's
+# machine-readable error code. The daemon speaks clean machine errors; the
+# LLM-facing "which tool fixes this" hints live here, in the adapter.
+_DAEMON_CODE_GUIDANCE = {
+    "invalid_agent_name": "Use miragen_list_agents to see existing agents.",
+    "agent_not_found": "Use miragen_list_agents to see available agents.",
+    "agent_exists": (
+        "Use miragen_get_agent to inspect it, or miragen_delete_agent first "
+        "if you want to recreate it."
+    ),
+    "container_not_found": (
+        "If the agent exists but was never started, use miragen_start_agent instead."
+    ),
+    "container_operation_failed": "Check miragen_get_agent_logs for details.",
+    "validation_failed": (
+        "Fix the YAML and retry. miragen_validate_yaml checks a profile "
+        "without creating anything."
+    ),
+    "tool_not_found": "Use miragen_list_tools to see registered tools.",
+    "edit_conflict": (
+        "Fetch the current content first and copy old_str from it exactly, "
+        "with enough surrounding context to be unique."
+    ),
+    "archive_not_found": (
+        "The archive must be under the workspace exports/ directory — "
+        "miragen_export_agent writes archives there."
+    ),
+    "job_not_found": "Use miragen_list_retriggers to see scheduled jobs.",
+    "unauthorized": (
+        "This server's MIRAGEND_TOKEN does not match the daemon's — fix the "
+        "deployment configuration."
+    ),
+}
 
 
-def _exports_dir() -> Path:
-    """Directory holding agent export tarballs (sibling of the agents dir)."""
-    return AGENTS_DIR.parent / "exports"
+async def _daemon_request(
+    method: str,
+    path: str,
+    *,
+    json_body: dict | None = None,
+    params: dict | None = None,
+    timeout: float = 60,
+):
+    """One HTTP call to the miragend lifecycle daemon.
 
-
-def _safe_export_path(archive_path: str) -> tuple[Path | None, str | None]:
-    """Resolve a caller-supplied archive path and require it to live inside the
-    workspace exports/ directory. Accepts an absolute path (as returned by
-    miragen_export_agent), 'exports/<file>', or a bare '<file>'."""
-    if ".." in archive_path:
-        return None, "ERROR: path traversal not allowed"
-    base = _exports_dir().resolve()
-    p = Path(archive_path)
-    if p.is_absolute():
-        full = p.resolve()
-    else:
-        rel = p
-        if rel.parts and rel.parts[0] == "exports":
-            rel = Path(*rel.parts[1:])
-        full = (base / rel).resolve()
-    if full != base and not str(full).startswith(str(base) + os.sep):
+    Returns (parsed_json_or_text, None) on 2xx, (None, "ERROR: ...") otherwise.
+    Daemon errors arrive as {"detail", "code"}; the code selects the LLM-facing
+    follow-up guidance appended to the message.
+    """
+    headers = {"Authorization": f"Bearer {MIRAGEND_TOKEN}"} if MIRAGEND_TOKEN else {}
+    try:
+        async with httpx.AsyncClient(transport=_daemon_transport) as client:
+            resp = await client.request(
+                method,
+                f"{MIRAGEND_URL}{path}",
+                json=json_body,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+    except httpx.ConnectError:
         return None, (
-            f"ERROR: archive_path must be inside the workspace exports/ directory. "
-            "Pass the path miragen_export_agent returned, or 'exports/<file>.tar.gz'."
+            f"ERROR: could not reach the miragend lifecycle daemon at {MIRAGEND_URL}. "
+            "The daemon container is probably not running or not on miragen-net — "
+            "agent lifecycle operations are unavailable until it is back."
         )
-    return full, None
+    except httpx.TimeoutException:
+        return None, (
+            f"ERROR: miragend did not respond within {timeout:.0f} seconds. "
+            "The daemon may be busy starting a container; retry shortly."
+        )
+    except Exception as exc:
+        return None, f"ERROR: {exc}"
 
+    if resp.status_code < 300:
+        try:
+            return resp.json(), None
+        except ValueError:
+            return resp.text, None
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(detail, str):
+        detail = str(detail) if detail is not None else resp.text[:500]
+    code = body.get("code") if isinstance(body, dict) else None
+    guidance = _DAEMON_CODE_GUIDANCE.get(code)
+    message = f"ERROR: {detail}"
+    if guidance:
+        message += f"\n{guidance}" if "\n" in detail else f" {guidance}"
+    return None, message
+
+
+# ---------------------------------------------------------------------------
+# Agent HTTP client (unchanged: run/approval traffic goes direct, not via
+# the daemon — this server sits on miragen-net either way)
+# ---------------------------------------------------------------------------
 
 # Test seam: when set (httpx.MockTransport in tests), agent HTTP calls route
 # through it instead of the docker network.
@@ -243,137 +268,6 @@ async def _agent_request(
         )
     except Exception as exc:
         return None, f"ERROR: {exc}"
-
-
-def _container_status(name: str) -> str:
-    try:
-        return _docker.containers.get(name).status
-    except docker.errors.NotFound:
-        return "not found"
-    except Exception as exc:
-        return f"error: {exc}"
-
-
-def _read_yaml(path: Path) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
-
-
-def _write_yaml(path: Path, data: dict) -> None:
-    with open(path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-
-def _compose_load() -> dict:
-    if COMPOSE_FILE.exists():
-        return _read_yaml(COMPOSE_FILE)
-    return {
-        "secrets": {k: {"external": True} for k in _secret_names()},
-        "services": {},
-        "networks": {"miragen-net": {"external": True}},
-    }
-
-
-def _secret_names() -> list[str]:
-    """Derive Docker secret names from non-empty *_API_KEY_FILE env vars on this container."""
-    secrets = []
-    for k, v in os.environ.items():
-        if k.endswith("_API_KEY_FILE") and v:
-            secrets.append(Path(v).name)
-    return secrets
-
-
-def _ensure_agent_network() -> None:
-    try:
-        _docker.networks.get("miragen-net")
-    except docker.errors.NotFound:
-        _docker.networks.create("miragen-net", driver="bridge", attachable=True)
-
-
-def _compose_add_service(name: str) -> None:
-    _ensure_agent_network()
-    secret_names = _secret_names()
-    env = {"AGENT_PROFILE": "agent.yaml"}
-    if MIRAGEN_INTERNAL_TOKEN:
-        # Enable the agent's own /run* guard with the same shared token this
-        # server authenticates with. Without it a managed agent boots
-        # unprotected while we send X-Miragen-Token — the header is required by
-        # no one. Forwarded as a plain value, consistent with *_API_KEY below.
-        env["MIRAGEN_INTERNAL_TOKEN"] = MIRAGEN_INTERNAL_TOKEN
-    for k, v in os.environ.items():
-        if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
-            env[k] = v
-
-    data = _compose_load()
-    data["networks"] = {"miragen-net": {"external": True}}
-    data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
-    data.setdefault("services", {})[name] = {
-        "image": MIRAGEN_BASE_IMAGE,
-        "container_name": name,
-        "restart": "unless-stopped",
-        "secrets": secret_names,
-        "environment": env,
-        "volumes": [f"./agents/{name}:/agent"],
-        "networks": ["miragen-net"],
-    }
-    _write_yaml(COMPOSE_FILE, data)
-
-
-def _compose_remove_service(name: str) -> None:
-    if not COMPOSE_FILE.exists():
-        return
-    data = _compose_load()
-    data.get("services", {}).pop(name, None)
-    _write_yaml(COMPOSE_FILE, data)
-
-
-def _parse_registered_tools(source: str) -> list[dict]:
-    """Return metadata for every @register-decorated async def in source."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    tools = []
-    for node in tree.body:
-        if not isinstance(node, ast.AsyncFunctionDef):
-            continue
-        for dec in node.decorator_list:
-            tool_name = node.name
-            if isinstance(dec, ast.Name) and dec.id == "register":
-                pass
-            elif (
-                isinstance(dec, ast.Call)
-                and isinstance(dec.func, ast.Name)
-                and dec.func.id == "register"
-                and dec.args
-                and isinstance(dec.args[0], ast.Constant)
-            ):
-                tool_name = dec.args[0].value
-            else:
-                continue
-            args = [a.arg for a in node.args.args]
-            tools.append(
-                {
-                    "name": tool_name,
-                    "description": ast.get_docstring(node) or "",
-                    "signature": f"({', '.join(args)})",
-                }
-            )
-            break
-    return tools
-
-
-def _find_function_span(source: str, func_name: str) -> tuple[int, int] | None:
-    """Return (start_line_0indexed, end_line_exclusive) for the named top-level async def."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return None
-    for node in tree.body:
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == func_name:
-            start = node.decorator_list[0].lineno - 1 if node.decorator_list else node.lineno - 1
-            return start, node.end_lineno
-    return None
 
 
 def _annotations(
@@ -460,63 +354,44 @@ mcp = FastMCP("miragen_mcp")
     name="miragen_list_agents",
     annotations=_annotations("List Agents", read_only=True, idempotent=True),
 )
-def list_agents() -> dict:
-    """List every miragen agent in the workspace.
+async def list_agents() -> dict:
+    """List every miragen agent in the swarm workspace (served by the miragend
+    lifecycle daemon).
 
-    Returns: {"count": int, "agents": [{"name", "status", "mode", "model"}, ...]}.
-    "status" is the Docker container state ("running", "exited", "not found", ...).
-    Start here to discover valid agent names for the other miragen tools.
+    Returns: {"count": int, "agents": [{"name", "status", "mode", "model",
+    "endpoint"}, ...]}. "status" is the Docker container state ("running",
+    "exited", "not found", ...); "endpoint" is the agent's HTTP address on
+    miragen-net. Start here to discover valid agent names for the other
+    miragen tools.
     """
-    result = []
-    if AGENTS_DIR.exists():
-        for entry in sorted(AGENTS_DIR.iterdir()):
-            if not entry.is_dir():
-                continue
-            name = entry.name
-            mode = model = ""
-            yaml_path = entry / "agent.yaml"
-            if yaml_path.exists():
-                try:
-                    data = _read_yaml(yaml_path)
-                    mode = data.get("mode", "")
-                    model = data.get("spec", {}).get("model", "")
-                except Exception:
-                    pass
-            result.append({"name": name, "status": _container_status(name), "mode": mode, "model": model})
-    return {"count": len(result), "agents": result}
+    body, err = await _daemon_request("GET", "/agents")
+    return body if err is None else {"error": err}
 
 
 @mcp.tool(
     name="miragen_get_agent",
     annotations=_annotations("Get Agent Details", read_only=True, idempotent=True),
 )
-def get_agent(name: AgentName) -> dict:
+async def get_agent(name: AgentName) -> dict:
     """Get full details for one agent.
 
     Returns: {"name", "yaml" (raw agent.yaml text), "status" (container state),
-    "has_tools" (whether tools.py exists)}. On failure returns {"error": "ERROR: ..."}.
-    Use miragen_list_tools to inspect the individual tools in tools.py.
+    "has_tools" (whether tools.py exists), "endpoint"}. On failure returns
+    {"error": "ERROR: ..."}. Use miragen_list_tools to inspect the individual
+    tools in tools.py.
     """
     err = _check_agent_name(name)
     if err:
         return {"error": err}
-    d = _agent_dir(name)
-    if not d.exists():
-        return {"error": f"ERROR: agent '{name}' not found. Use miragen_list_agents to see available agents."}
-    yaml_path = d / "agent.yaml"
-    return {
-        "name": name,
-        "yaml": yaml_path.read_text() if yaml_path.exists() else "",
-        "status": _container_status(name),
-        "has_tools": (d / "tools.py").exists(),
-    }
+    body, err = await _daemon_request("GET", f"/agents/{name}")
+    return body if err is None else {"error": err}
 
 
 @mcp.tool(
     name="miragen_create_agent",
     annotations=_annotations("Create Agent"),
 )
-def create_agent(
+async def create_agent(
     name: AgentName,
     yaml_source: Annotated[
         str,
@@ -530,7 +405,8 @@ def create_agent(
         ),
     ],
 ) -> str:
-    """Create a new agent: write its workspace, register it in compose.yml, start its container.
+    """Create a new agent: the miragend daemon writes its workspace, registers it
+    in compose.yml, and starts its container.
 
     The YAML is validated before anything is started; on any failure the workspace is
     rolled back and an "ERROR: ..." string explains what to fix. On success the agent
@@ -540,63 +416,22 @@ def create_agent(
     err = _check_agent_name(name)
     if err:
         return err
-    d = _agent_dir(name)
-    if d.exists():
-        return (
-            f"ERROR: agent '{name}' already exists. Use miragen_get_agent to inspect it, "
-            "or miragen_delete_agent first if you want to recreate it."
-        )
-    try:
-        d.mkdir(parents=True)
-        yaml_path = d / "agent.yaml"
-        yaml_path.write_text(yaml_source)
-
-        result = subprocess.run(
-            ["miragen", "validate", f"agents/{name}/agent.yaml"],
-            capture_output=True, text=True, cwd=WORKSPACE,
-        )
-        if result.returncode != 0:
-            shutil.rmtree(d)
-            return (
-                f"ERROR: profile validation failed:\n{(result.stdout + result.stderr).strip()}\n"
-                "Fix the YAML and retry. miragen_validate_yaml checks a profile without creating anything."
-            )
-
-        profile_name = (yaml.safe_load(yaml_source) or {}).get("name")
-        if profile_name != name:
-            shutil.rmtree(d)
-            return (
-                f"ERROR: profile 'name' field is '{profile_name}' but the agent is being created as "
-                f"'{name}'. They must match — set 'name: {name}' in the YAML."
-            )
-
-        (d / "tools.py").write_text(f"from miragen import register\n\n# Tools for {name}\n")
-
-        _compose_add_service(name)
-
-        up = subprocess.run(
-            ["docker", "compose", "up", "-d", name],
-            capture_output=True, text=True, cwd=WORKSPACE,
-        )
-        if up.returncode != 0:
-            _compose_remove_service(name)
-            shutil.rmtree(d)
-            return f"ERROR: container failed to start:\n{up.stderr.strip()}"
-
-        return (
-            f"Agent {name} created and started. "
-            f"Next: miragen_get_agent_logs to verify startup, miragen_register_tool to add tools."
-        )
-    except Exception as exc:
-        shutil.rmtree(d, ignore_errors=True)
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request(
+        "POST", "/agents", json_body={"name": name, "yaml_source": yaml_source}
+    )
+    if err:
+        return err
+    return (
+        f"Agent {name} created and started. "
+        f"Next: miragen_get_agent_logs to verify startup, miragen_register_tool to add tools."
+    )
 
 
 @mcp.tool(
     name="miragen_update_agent_config",
     annotations=_annotations("Update Agent Config", destructive=True, idempotent=True),
 )
-def update_agent_config(
+async def update_agent_config(
     agent: AgentName,
     yaml_source: Annotated[
         str,
@@ -612,7 +447,7 @@ def update_agent_config(
 ) -> str:
     """Validate and apply a new agent.yaml for an existing agent, then restart it.
 
-    The candidate YAML is validated with the miragen CLI before anything is touched; on
+    The candidate YAML is validated by the daemon before anything is touched; on
     validation failure the current config is left untouched. If validation passes but the
     restart fails, the previous config is restored and the agent is restarted again
     (best effort). This is the validated alternative to editing agent.yaml directly with
@@ -622,65 +457,13 @@ def update_agent_config(
     err = _check_agent_name(agent)
     if err:
         return err
-    d = _agent_dir(agent)
-    yaml_path = d / "agent.yaml"
-    if not d.exists() or not yaml_path.exists():
-        return (
-            f"ERROR: agent '{agent}' not found. Use miragen_list_agents to see available "
-            "agents, or miragen_create_agent to create it."
-        )
-
-    candidate_path = d / "agent.yaml.candidate"
-    candidate_path.write_text(yaml_source)
-
-    result = subprocess.run(
-        ["miragen", "validate", f"agents/{agent}/agent.yaml.candidate"],
-        capture_output=True, text=True, cwd=WORKSPACE,
+    body, err = await _daemon_request(
+        "PUT", f"/agents/{agent}/config", json_body={"yaml_source": yaml_source}
     )
-    if result.returncode != 0:
-        candidate_path.unlink(missing_ok=True)
-        return (
-            f"ERROR: validation failed:\n{(result.stdout + result.stderr).strip()}\n\n"
-            "The current config is untouched."
-        )
-
-    profile_name = (yaml.safe_load(yaml_source) or {}).get("name")
-    if profile_name != agent:
-        candidate_path.unlink(missing_ok=True)
-        return (
-            f"ERROR: profile 'name' field is '{profile_name}' but the agent being updated is "
-            f"'{agent}'. They must match — set 'name: {agent}' in the YAML."
-        )
-
-    original_content = yaml_path.read_text()
-    try:
-        old_data = yaml.safe_load(original_content)
-    except Exception:
-        old_data = {}
-    if not isinstance(old_data, dict):
-        old_data = {}
-    try:
-        new_data = yaml.safe_load(yaml_source)
-    except Exception:
-        new_data = {}
-    if not isinstance(new_data, dict):
-        new_data = {}
-
-    os.replace(candidate_path, yaml_path)
-
-    restart_result = restart_agent(agent)
-    if restart_result.startswith("ERROR"):
-        yaml_path.write_text(original_content)
-        restart_agent(agent)
-        return (
-            "ERROR: new config applied but restart failed — previous config restored: "
-            f"{restart_result}"
-        )
-
-    changed_keys = sorted(
-        k for k in (set(old_data) | set(new_data)) if old_data.get(k) != new_data.get(k)
-    )
-    summary = ", ".join(changed_keys) if changed_keys else "(no top-level keys changed)"
+    if err:
+        return err
+    changed = body.get("changed_keys") or []
+    summary = ", ".join(changed) if changed else "(no top-level keys changed)"
     return f"Config updated and {agent} restarted. Diff summary: {summary}"
 
 
@@ -688,8 +471,8 @@ def update_agent_config(
     name="miragen_start_agent",
     annotations=_annotations("Start Agent", idempotent=True),
 )
-def start_agent(name: AgentName) -> str:
-    """Start an agent's container via docker compose.
+async def start_agent(name: AgentName) -> str:
+    """Start an agent's container via the miragend daemon (docker compose).
 
     Works even if the container was never created (compose creates it). Idempotent —
     starting a running agent is a no-op. Returns "Agent <name> started." or "ERROR: ...".
@@ -697,28 +480,15 @@ def start_agent(name: AgentName) -> str:
     err = _check_agent_name(name)
     if err:
         return err
-    if not _agent_dir(name).exists():
-        return (
-            f"ERROR: agent '{name}' not found in workspace. Use miragen_list_agents to see "
-            "available agents, or miragen_create_agent to create it."
-        )
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "up", "-d", name],
-            capture_output=True, text=True, cwd=WORKSPACE,
-        )
-        if result.returncode != 0:
-            return f"ERROR: {result.stderr.strip()}"
-        return f"Agent {name} started."
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request("POST", f"/agents/{name}/start")
+    return err if err else f"Agent {name} started."
 
 
 @mcp.tool(
     name="miragen_restart_agent",
     annotations=_annotations("Restart Agent", idempotent=True),
 )
-def restart_agent(name: AgentName) -> str:
+async def restart_agent(name: AgentName) -> str:
     """Restart an agent's running Docker container (e.g. to pick up config changes).
 
     Note: miragen_register_tool / miragen_edit_tool / miragen_delete_tool already restart
@@ -727,23 +497,15 @@ def restart_agent(name: AgentName) -> str:
     err = _check_agent_name(name)
     if err:
         return err
-    try:
-        _docker.containers.get(name).restart()
-        return f"Agent {name} restarted."
-    except docker.errors.NotFound:
-        return (
-            f"ERROR: container '{name}' not found. If the agent exists but was never started, "
-            "use miragen_start_agent instead."
-        )
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request("POST", f"/agents/{name}/restart")
+    return err if err else f"Agent {name} restarted."
 
 
 @mcp.tool(
     name="miragen_stop_agent",
     annotations=_annotations("Stop Agent", idempotent=True),
 )
-def stop_agent(name: AgentName) -> str:
+async def stop_agent(name: AgentName) -> str:
     """Stop an agent's Docker container without deleting anything.
 
     The workspace and compose entry remain; use miragen_start_agent to bring it back.
@@ -752,20 +514,15 @@ def stop_agent(name: AgentName) -> str:
     err = _check_agent_name(name)
     if err:
         return err
-    try:
-        _docker.containers.get(name).stop()
-        return f"Agent {name} stopped."
-    except docker.errors.NotFound:
-        return f"ERROR: container '{name}' not found. Use miragen_list_agents to check agent status."
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request("POST", f"/agents/{name}/stop")
+    return err if err else f"Agent {name} stopped."
 
 
 @mcp.tool(
     name="miragen_delete_agent",
     annotations=_annotations("Delete Agent", destructive=True, idempotent=True),
 )
-def delete_agent(name: AgentName) -> str:
+async def delete_agent(name: AgentName) -> str:
     """Permanently delete an agent: stop and remove its container, remove it from
     compose.yml, and delete its entire workspace (agent.yaml, tools.py, all files).
 
@@ -775,29 +532,15 @@ def delete_agent(name: AgentName) -> str:
     err = _check_agent_name(name)
     if err:
         return err
-    d = _agent_dir(name)
-    try:
-        try:
-            container = _docker.containers.get(name)
-            container.stop()
-            container.remove()
-        except docker.errors.NotFound:
-            pass
-        except Exception as exc:
-            return f"ERROR: {exc}"
-        _compose_remove_service(name)
-        if d.exists():
-            shutil.rmtree(d)
-        return f"Agent {name} deleted."
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request("DELETE", f"/agents/{name}")
+    return err if err else f"Agent {name} deleted."
 
 
 @mcp.tool(
     name="miragen_get_agent_logs",
     annotations=_annotations("Get Agent Logs", read_only=True, idempotent=True),
 )
-def get_agent_logs(
+async def get_agent_logs(
     name: AgentName,
     tail: Annotated[
         int,
@@ -817,16 +560,12 @@ def get_agent_logs(
     err = _check_agent_name(name)
     if err:
         return err
-    try:
-        logs = _docker.containers.get(name).logs(tail=min(max(tail, 1), 1000), stream=False)
-        return _truncate(logs.decode("utf-8", errors="replace"))
-    except docker.errors.NotFound:
-        return (
-            f"ERROR: container '{name}' not found. The agent may never have been started — "
-            "use miragen_start_agent, or miragen_list_agents to check status."
-        )
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    body, err = await _daemon_request(
+        "GET", f"/agents/{name}/logs", params={"tail": min(max(tail, 1), 1000)}
+    )
+    if err:
+        return err
+    return _truncate(body.get("logs", "") if isinstance(body, dict) else str(body))
 
 
 # ---- Backup & migration -----------------------------------------------------
@@ -841,94 +580,43 @@ def get_agent_logs(
     # artifact.
     annotations=_annotations("Export Agent"),
 )
-def export_agent(agent: AgentName) -> dict:
+async def export_agent(agent: AgentName) -> dict:
     """Export an agent's workspace to a gzipped tarball for backup or migration.
 
     The archive is written to the host workspace under exports/<agent>-<timestamp>.tar.gz
     and contains agent.yaml, tools.py, and any data files. Excluded: runs/, history.json,
     __pycache__/, and any single file over 10 MB (skipped and listed in "skipped"). The
     compose entry and secrets are NOT exported — miragen_import_agent regenerates those
-    from the current server environment.
+    from the daemon's environment.
 
     Returns {"agent", "archive_path" (host path), "included" (relative file list),
     "skipped", "size_bytes", "hint"}. Refuses if the archive would exceed 50 MB. The
     archive lives outside every agent workspace, so miragen_read_agent_file cannot fetch
-    it — copy it off the host, or import it on another miragen-mcp with
+    it — copy it off the host, or import it on another deployment with
     miragen_import_agent. On failure returns {"error": "ERROR: ..."}.
     """
     err = _check_agent_name(agent)
     if err:
         return {"error": err}
-    d = _agent_dir(agent)
-    if not d.exists():
-        return {"error": f"ERROR: agent '{agent}' not found. Use miragen_list_agents to see available agents."}
-
-    exports = _exports_dir()
-    try:
-        exports.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        archive_path = exports / f"{agent}-{timestamp}.tar.gz"
-
-        included: list[str] = []
-        skipped: list[dict] = []
-        members: list[tuple[Path, str]] = []
-        for root, dirs, files in os.walk(d):
-            dirs[:] = [sub for sub in dirs if sub not in EXPORT_EXCLUDE_DIRS]
-            for fname in files:
-                fp = Path(root) / fname
-                rel = fp.relative_to(d)
-                if fname in EXPORT_EXCLUDE_FILES:
-                    skipped.append({"path": str(rel), "reason": "excluded (run history)"})
-                    continue
-                if fp.is_symlink():
-                    skipped.append({"path": str(rel), "reason": "symlink not exported"})
-                    continue
-                size = fp.stat().st_size
-                if size > MAX_EXPORT_FILE_BYTES:
-                    skipped.append(
-                        {"path": str(rel), "reason": f"exceeds 10 MB cap ({size} bytes)"}
-                    )
-                    continue
-                members.append((fp, f"{agent}/{rel.as_posix()}"))
-
-        with tarfile.open(archive_path, "w:gz") as tar:
-            for fp, arcname in members:
-                tar.add(fp, arcname=arcname, recursive=False)
-                included.append(arcname[len(agent) + 1 :])
-
-        size_bytes = archive_path.stat().st_size
-        if size_bytes > MAX_ARCHIVE_BYTES:
-            archive_path.unlink(missing_ok=True)
-            return {
-                "error": (
-                    f"ERROR: export archive would be {size_bytes} bytes, over the 50 MB cap. "
-                    "Trim large files from the agent workspace and retry."
-                )
-            }
-
-        return {
-            "agent": agent,
-            "archive_path": str(archive_path),
-            "included": sorted(included),
-            "skipped": skipped,
-            "size_bytes": size_bytes,
-            "hint": (
-                "This archive is on the host workspace, outside any agent workspace, so "
-                "miragen_read_agent_file cannot fetch it. Copy it off the host, or import it "
-                f"on another miragen-mcp with miragen_import_agent(name=..., archive_path="
-                f"'exports/{archive_path.name}'). The compose entry and secrets are not in the "
-                "archive — import regenerates them from the current server environment."
-            ),
-        }
-    except Exception as exc:
-        return {"error": f"ERROR: {exc}"}
+    body, err = await _daemon_request("POST", f"/agents/{agent}/export", timeout=120)
+    if err:
+        return {"error": err}
+    archive_name = body.get("archive_path", "").rsplit("/", 1)[-1]
+    body["hint"] = (
+        "This archive is on the host workspace, outside any agent workspace, so "
+        "miragen_read_agent_file cannot fetch it. Copy it off the host, or import it "
+        f"on another deployment with miragen_import_agent(name=..., archive_path="
+        f"'exports/{archive_name}'). The compose entry and secrets are not in the "
+        "archive — import regenerates them from the daemon's environment."
+    )
+    return body
 
 
 @mcp.tool(
     name="miragen_import_agent",
     annotations=_annotations("Import Agent"),
 )
-def import_agent(
+async def import_agent(
     name: AgentName,
     archive_path: Annotated[
         str,
@@ -952,109 +640,30 @@ def import_agent(
     Refuses if an agent named `name` already exists (delete it first with
     miragen_delete_agent). The archive must live in the workspace exports/ directory and is
     extracted with tarfile's "data" filter, which rejects absolute paths, path traversal,
-    and links. The profile's 'name' field is rewritten to `name` and validated with the
-    miragen CLI before anything is registered; any failure rolls the import back completely
-    (workspace removed, compose entry removed). The compose entry and secrets are
-    regenerated from this server's environment — they are never taken from the archive.
+    and links. The profile's 'name' field is rewritten to `name` and validated before
+    anything is registered; any failure rolls the import back completely (workspace
+    removed, compose entry removed). The compose entry and secrets are regenerated from
+    the daemon's environment — they are never taken from the archive.
     Returns a success message or "ERROR: ...".
     """
     err = _check_agent_name(name)
     if err:
         return err
-    d = _agent_dir(name)
-    if d.exists():
-        return (
-            f"ERROR: agent '{name}' already exists. Delete it with miragen_delete_agent first, "
-            "or import under a different name."
-        )
-    full, perr = _safe_export_path(archive_path)
-    if perr:
-        return perr
-    if not full.exists():
-        return (
-            f"ERROR: archive not found: {archive_path}. It must be under the workspace exports/ "
-            "directory — miragen_export_agent writes archives there."
-        )
-
-    staging = None
-    created_dir = False
-    added_service = False
-    try:
-        _exports_dir().mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(dir=_exports_dir(), prefix=f".import-{name}-"))
-        try:
-            with tarfile.open(full, "r:gz") as tar:
-                tar.extractall(path=staging, filter="data")
-        except (tarfile.TarError, ValueError, OSError) as exc:
-            return (
-                f"ERROR: could not safely extract '{archive_path}': {exc}. The archive may be "
-                "corrupt or contain unsafe (absolute/traversal/link) members."
-            )
-
-        # Exports wrap everything under a single "<orig_name>/" directory; unwrap it.
-        entries = list(staging.iterdir())
-        top_dirs = [p for p in entries if p.is_dir()]
-        if len(entries) == 1 and len(top_dirs) == 1:
-            src_root = top_dirs[0]
-        else:
-            src_root = staging
-
-        yaml_src = src_root / "agent.yaml"
-        if not yaml_src.exists():
-            return (
-                "ERROR: archive has no agent.yaml at its root — it does not look like a "
-                "miragen_export_agent tarball."
-            )
-
-        # Rewrite the top-level name in place, preserving formatting/comments.
-        original_text = yaml_src.read_text()
-        rewritten, n = re.subn(r"(?m)^name:.*$", f"name: {name}", original_text, count=1)
-        if n == 0:
-            rewritten = f"name: {name}\n" + original_text
-        yaml_src.write_text(rewritten)
-
-        result = subprocess.run(
-            ["miragen", "validate", str(yaml_src)],
-            capture_output=True, text=True, cwd=WORKSPACE,
-        )
-        if result.returncode != 0:
-            return (
-                f"ERROR: imported profile failed validation:\n{(result.stdout + result.stderr).strip()}\n"
-                "The import was rolled back. Fix the source agent and re-export."
-            )
-
-        d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_root), str(d))
-        created_dir = True
-
-        _compose_add_service(name)
-        added_service = True
-
-        if start:
-            up = subprocess.run(
-                ["docker", "compose", "up", "-d", name],
-                capture_output=True, text=True, cwd=WORKSPACE,
-            )
-            if up.returncode != 0:
-                _compose_remove_service(name)
-                shutil.rmtree(d, ignore_errors=True)
-                return f"ERROR: agent imported but container failed to start:\n{up.stderr.strip()}"
-
-        tail = (
-            f"Agent {name} imported from {Path(archive_path).name} and started."
-            if start
-            else f"Agent {name} imported from {Path(archive_path).name} (not started; use miragen_start_agent)."
-        )
-        return tail + " Register any missing secrets and check miragen_get_agent_logs."
-    except Exception as exc:
-        if added_service:
-            _compose_remove_service(name)
-        if created_dir:
-            shutil.rmtree(d, ignore_errors=True)
-        return f"ERROR: {exc}"
-    finally:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
+    _, err = await _daemon_request(
+        "POST",
+        "/agents/import",
+        json_body={"name": name, "archive_path": archive_path, "start": start},
+        timeout=120,
+    )
+    if err:
+        return err
+    archive_name = archive_path.rsplit("/", 1)[-1]
+    tail = (
+        f"Agent {name} imported from {archive_name} and started."
+        if start
+        else f"Agent {name} imported from {archive_name} (not started; use miragen_start_agent)."
+    )
+    return tail + " Register any missing secrets and check miragen_get_agent_logs."
 
 
 # ---- Tool management --------------------------------------------------------
@@ -1064,7 +673,7 @@ def import_agent(
     name="miragen_list_tools",
     annotations=_annotations("List Agent Tools", read_only=True, idempotent=True),
 )
-def list_tools(agent: AgentName) -> dict:
+async def list_tools(agent: AgentName) -> dict:
     """List the @register-decorated tool functions in an agent's tools.py.
 
     Returns: {"count": int, "tools": [{"name", "description" (docstring), "signature"}, ...]}.
@@ -1074,19 +683,15 @@ def list_tools(agent: AgentName) -> dict:
     err = _check_agent_name(agent)
     if err:
         return {"error": err}
-    p = _agent_dir(agent) / "tools.py"
-    if not p.exists():
-        tools: list[dict] = []
-    else:
-        tools = _parse_registered_tools(p.read_text())
-    return {"count": len(tools), "tools": tools}
+    body, err = await _daemon_request("GET", f"/agents/{agent}/tools")
+    return body if err is None else {"error": err}
 
 
 @mcp.tool(
     name="miragen_get_tool_source",
     annotations=_annotations("Get Tool Source", read_only=True, idempotent=True),
 )
-def get_tool_source(agent: AgentName, tool_name: ToolName) -> str:
+async def get_tool_source(agent: AgentName, tool_name: ToolName) -> str:
     """Return the full Python source (decorator included) of one tool in the agent's tools.py.
 
     Read this before miragen_edit_tool so your old_str matches exactly.
@@ -1095,25 +700,17 @@ def get_tool_source(agent: AgentName, tool_name: ToolName) -> str:
     err = _check_agent_name(agent)
     if err:
         return err
-    p = _agent_dir(agent) / "tools.py"
-    if not p.exists():
-        return f"ERROR: tools.py not found for agent '{agent}'. Use miragen_list_agents to see available agents."
-    source = p.read_text()
-    span = _find_function_span(source, tool_name)
-    if span is None:
-        return (
-            f"ERROR: tool '{tool_name}' not found in {agent}/tools.py. "
-            "Use miragen_list_tools to see registered tools."
-        )
-    lines = source.splitlines(keepends=True)
-    return "".join(lines[span[0]:span[1]])
+    body, err = await _daemon_request("GET", f"/agents/{agent}/tools/{tool_name}")
+    if err:
+        return err
+    return body.get("source", "") if isinstance(body, dict) else str(body)
 
 
 @mcp.tool(
     name="miragen_register_tool",
     annotations=_annotations("Register Agent Tool"),
 )
-def register_tool(
+async def register_tool(
     agent: AgentName,
     tool_name: ToolName,
     source: Annotated[
@@ -1140,61 +737,21 @@ def register_tool(
     err = _check_agent_name(agent)
     if err:
         return err
-    tools_path = _agent_dir(agent) / "tools.py"
-    yaml_path = _agent_dir(agent) / "agent.yaml"
-    if not tools_path.exists():
-        return (
-            f"ERROR: tools.py not found for agent '{agent}'. "
-            "Use miragen_list_agents to see available agents."
-        )
-
-    try:
-        ast.parse(source)
-    except SyntaxError as exc:
-        return f"ERROR: source is not valid Python: {exc}. Fix the syntax and retry."
-    parsed = _parse_registered_tools(source)
-    if not any(t["name"] == tool_name for t in parsed):
-        found = [t["name"] for t in parsed] or "none"
-        return (
-            f"ERROR: source does not define a @register-decorated async function registered as "
-            f"'{tool_name}' (found: {found}). The function must be `async def`, decorated with "
-            "@register, and its name (or @register('name') argument) must equal tool_name."
-        )
-
-    original_tools = tools_path.read_text()
-    original_yaml = yaml_path.read_text() if yaml_path.exists() else None
-
-    try:
-        tools_path.write_text(original_tools.rstrip("\n") + "\n\n" + source.strip() + "\n")
-
-        if yaml_path.exists():
-            data = _read_yaml(yaml_path)
-            tools_list: list = data.get("tools", [])
-            if tool_name not in tools_list:
-                tools_list.append(tool_name)
-                data["tools"] = tools_list
-                _write_yaml(yaml_path, data)
-
-        result = restart_agent(agent)
-        if result.startswith("ERROR"):
-            tools_path.write_text(original_tools)
-            if original_yaml is not None:
-                yaml_path.write_text(original_yaml)
-            return f"ERROR: tool written but restart failed (rolled back): {result}"
-
-        return f"Tool {tool_name} registered on {agent} and agent restarted."
-    except Exception as exc:
-        tools_path.write_text(original_tools)
-        if original_yaml is not None:
-            yaml_path.write_text(original_yaml)
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request(
+        "POST",
+        f"/agents/{agent}/tools",
+        json_body={"tool_name": tool_name, "source": source},
+    )
+    if err:
+        return err
+    return f"Tool {tool_name} registered on {agent} and agent restarted."
 
 
 @mcp.tool(
     name="miragen_edit_tool",
     annotations=_annotations("Edit Agent Tool", destructive=True),
 )
-def edit_tool(
+async def edit_tool(
     agent: AgentName,
     tool_name: ToolName,
     old_str: Annotated[
@@ -1220,35 +777,13 @@ def edit_tool(
     err = _check_agent_name(agent)
     if err:
         return err
-    tools_path = _agent_dir(agent) / "tools.py"
-    if not tools_path.exists():
-        return f"ERROR: tools.py not found for agent '{agent}'. Use miragen_list_agents to see available agents."
-
-    source = tools_path.read_text()
-    span = _find_function_span(source, tool_name)
-    if span is None:
-        return f"ERROR: tool '{tool_name}' not found. Use miragen_list_tools to see registered tools."
-
-    lines = source.splitlines(keepends=True)
-    before = "".join(lines[: span[0]])
-    target = "".join(lines[span[0] : span[1]])
-    after = "".join(lines[span[1] :])
-
-    count = target.count(old_str)
-    if count == 0:
-        return (
-            f"ERROR: old_str not found within tool '{tool_name}'. Use miragen_get_tool_source to "
-            "fetch its current source and copy old_str from it exactly."
-        )
-    if count > 1:
-        return (
-            f"ERROR: old_str appears {count} times within tool '{tool_name}' — must be unique. "
-            "Include more surrounding context."
-        )
-    tools_path.write_text(before + target.replace(old_str, new_str, 1) + after)
-    result = restart_agent(agent)
-    if result.startswith("ERROR"):
-        return f"Tool edited but restart failed: {result}"
+    _, err = await _daemon_request(
+        "PATCH",
+        f"/agents/{agent}/tools/{tool_name}",
+        json_body={"old_str": old_str, "new_str": new_str},
+    )
+    if err:
+        return err
     return f"Tool '{tool_name}' edited and {agent} restarted."
 
 
@@ -1256,7 +791,7 @@ def edit_tool(
     name="miragen_delete_tool",
     annotations=_annotations("Delete Agent Tool", destructive=True, idempotent=True),
 )
-def delete_tool(agent: AgentName, tool_name: ToolName) -> str:
+async def delete_tool(agent: AgentName, tool_name: ToolName) -> str:
     """Remove a tool from an agent: delete the function from tools.py, remove it from the
     agent.yaml whitelist, and restart the agent.
 
@@ -1266,28 +801,10 @@ def delete_tool(agent: AgentName, tool_name: ToolName) -> str:
     err = _check_agent_name(agent)
     if err:
         return err
-    tools_path = _agent_dir(agent) / "tools.py"
-    yaml_path = _agent_dir(agent) / "agent.yaml"
-    if not tools_path.exists():
-        return f"ERROR: tools.py not found for agent '{agent}'. Use miragen_list_agents to see available agents."
-
-    source = tools_path.read_text()
-    span = _find_function_span(source, tool_name)
-    if span is None:
-        return f"ERROR: tool '{tool_name}' not found. Use miragen_list_tools to see registered tools."
-
-    lines = source.splitlines(keepends=True)
-    tools_path.write_text("".join(lines[: span[0]] + lines[span[1] :]))
-
-    if yaml_path.exists():
-        data = _read_yaml(yaml_path)
-        tools_list: list = data.get("tools", [])
-        if tool_name in tools_list:
-            tools_list.remove(tool_name)
-            data["tools"] = tools_list
-            _write_yaml(yaml_path, data)
-
-    return restart_agent(agent)
+    _, err = await _daemon_request("DELETE", f"/agents/{agent}/tools/{tool_name}")
+    if err:
+        return err
+    return f"Agent {agent} restarted."
 
 
 # ---- Agent filesystem tools -------------------------------------------------
@@ -1297,36 +814,33 @@ def delete_tool(agent: AgentName, tool_name: ToolName) -> str:
     name="miragen_read_agent_file",
     annotations=_annotations("Read Agent File", read_only=True, idempotent=True),
 )
-def read_agent_file(agent: AgentName, path: WorkspacePath) -> str:
+async def read_agent_file(agent: AgentName, path: WorkspacePath) -> str:
     """Read a file from an agent's workspace on the shared volume (mounted as /agent inside
-    the agent container — NOT the MCP server's own filesystem).
+    the agent container — NOT this MCP server's own filesystem).
 
     Output longer than 50,000 characters is truncated. Returns the file text or "ERROR: ...".
     """
     err = _check_agent_name(agent)
     if err:
         return err
-    full, err = _safe_path(agent, path)
+    body, err = await _daemon_request(
+        "GET", f"/agents/{agent}/files", params={"path": path}
+    )
     if err:
         return err
-    try:
-        return _truncate(full.read_text())
-    except FileNotFoundError:
-        return f"ERROR: file not found: {path}"
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    return _truncate(body.get("content", "") if isinstance(body, dict) else str(body))
 
 
 @mcp.tool(
     name="miragen_write_agent_file",
     annotations=_annotations("Write Agent File", destructive=True, idempotent=True),
 )
-def write_agent_file(
+async def write_agent_file(
     agent: AgentName,
     path: WorkspacePath,
     content: Annotated[str, Field(description="Full new file content (overwrites any existing content).")],
 ) -> str:
-    """Write (or overwrite) a file in an agent's workspace on the shared volume — NOT the
+    """Write (or overwrite) a file in an agent's workspace on the shared volume — NOT this
     MCP server's filesystem. Parent directories are created as needed; the file is
     immediately visible inside the agent container at /agent/<path>.
 
@@ -1338,25 +852,24 @@ def write_agent_file(
     err = _check_agent_name(agent)
     if err:
         return err
-    full, err = _safe_path(agent, path)
+    _, err = await _daemon_request(
+        "PUT",
+        f"/agents/{agent}/files",
+        json_body={"path": path, "content": content},
+    )
     if err:
         return err
-    try:
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content)
-        result = f"Written {path}"
-        if path == "agent.yaml":
-            result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
-        return result
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    result = f"Written {path}"
+    if path == "agent.yaml":
+        result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
+    return result
 
 
 @mcp.tool(
     name="miragen_edit_agent_file",
     annotations=_annotations("Edit Agent File", destructive=True),
 )
-def edit_agent_file(
+async def edit_agent_file(
     agent: AgentName,
     path: WorkspacePath,
     old_str: Annotated[
@@ -1372,7 +885,7 @@ def edit_agent_file(
     new_str: Annotated[str, Field(description="Replacement text.")],
 ) -> str:
     """Edit a file in an agent's workspace via exact string replacement (shared volume —
-    NOT the MCP server's filesystem). The change is immediately visible inside the agent
+    NOT this MCP server's filesystem). The change is immediately visible inside the agent
     container at /agent/<path>.
 
     Fails without modifying anything if old_str is missing or ambiguous.
@@ -1382,22 +895,13 @@ def edit_agent_file(
     err = _check_agent_name(agent)
     if err:
         return err
-    full, err = _safe_path(agent, path)
+    _, err = await _daemon_request(
+        "PATCH",
+        f"/agents/{agent}/files",
+        json_body={"path": path, "old_str": old_str, "new_str": new_str},
+    )
     if err:
         return err
-    try:
-        content = full.read_text()
-    except FileNotFoundError:
-        return f"ERROR: file not found: {path}"
-    count = content.count(old_str)
-    if count == 0:
-        return (
-            "ERROR: old_str not found. Use miragen_read_agent_file to fetch the current "
-            "content and copy old_str from it exactly."
-        )
-    if count > 1:
-        return f"ERROR: old_str appears {count} times — must be unique. Include more surrounding context."
-    full.write_text(content.replace(old_str, new_str, 1))
     result = f"Edited {path}"
     if path == "agent.yaml":
         result += "\nnote: this bypassed validation — prefer miragen_update_agent_config"
@@ -1407,26 +911,11 @@ def edit_agent_file(
 # ---- Scheduling -------------------------------------------------------------
 
 
-async def _fire_trigger(agent: str, prompt: str) -> None:
-    # Module-level by contract: the persistent SQLAlchemy job store pickles this
-    # callable by reference (module path + qualname). Keep it top-level so jobs
-    # scheduled before a restart can be unpickled and fired afterwards.
-    _, err = await _agent_request(agent, "POST", "/run", json_body={"prompt": prompt}, timeout=10)
-    if err:
-        logger.error("retrigger POST to %s failed: %s", agent, err)
-
-
-def _retrigger_agent(job_id: str) -> str | None:
-    """Extract the agent name from a 'retrigger-<agent>-<ts>' job id, or None."""
-    m = _RETRIGGER_ID_RE.fullmatch(job_id)
-    return m.group("agent") if m else None
-
-
 @mcp.tool(
     name="miragen_set_retrigger",
     annotations=_annotations("Schedule Agent Prompt", open_world=True),
 )
-def set_retrigger(
+async def set_retrigger(
     agent: AgentName,
     prompt: Annotated[
         str,
@@ -1453,57 +942,36 @@ def set_retrigger(
 
     Provide exactly one of `delay_seconds` or `at`. The delivery is fire-and-forget —
     check miragen_get_agent_logs afterwards to see the run. The agent must be running
-    when the schedule fires. Schedules are persisted and survive an MCP server restart
-    (a miss during downtime still fires if the server comes back within an hour). The
-    returned job_id can be passed to miragen_cancel_retrigger; see all scheduled jobs
-    with miragen_list_retriggers. Returns a confirmation with the fire time and job_id,
-    or "ERROR: ...".
+    when the schedule fires. Schedules are persisted by the miragend daemon and survive
+    its restart (a miss during downtime still fires if the daemon comes back within an
+    hour). The returned job_id can be passed to miragen_cancel_retrigger; see all
+    scheduled jobs with miragen_list_retriggers. Returns a confirmation with the fire
+    time and job_id, or "ERROR: ...".
     """
     err = _check_agent_name(agent)
     if err:
         return err
     if (delay_seconds is None) == (at is None):
         return "ERROR: provide exactly one of delay_seconds or at"
-    try:
-        if delay_seconds is not None:
-            if delay_seconds < 1:
-                return "ERROR: delay_seconds must be >= 1"
-            fire_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
-        else:
-            try:
-                fire_at = datetime.fromisoformat(at)  # type: ignore[arg-type]
-            except ValueError:
-                return (
-                    f"ERROR: '{at}' is not a valid ISO 8601 datetime. "
-                    "Use e.g. '2026-07-02T15:30:00+00:00' or pass delay_seconds instead."
-                )
-            if fire_at.tzinfo is None:
-                fire_at = fire_at.replace(tzinfo=timezone.utc)
-            if fire_at <= datetime.now(timezone.utc):
-                return f"ERROR: {fire_at.isoformat()} is in the past. Provide a future datetime."
-
-        job_id = f"retrigger-{agent}-{fire_at.timestamp():.0f}"
-        _scheduler.add_job(
-            _fire_trigger,
-            trigger=DateTrigger(run_date=fire_at),
-            args=[agent, prompt],
-            id=job_id,
-            replace_existing=True,
-            misfire_grace_time=RETRIGGER_MISFIRE_GRACE,
-        )
-        return (
-            f"Retrigger scheduled for {agent} at {fire_at.isoformat()} (job_id: {job_id}). "
-            "Cancel it with miragen_cancel_retrigger, or list all with miragen_list_retriggers."
-        )
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    payload: dict = {"agent": agent, "prompt": prompt}
+    if delay_seconds is not None:
+        payload["delay_seconds"] = delay_seconds
+    else:
+        payload["at"] = at
+    body, err = await _daemon_request("POST", "/schedules", json_body=payload)
+    if err:
+        return err
+    return (
+        f"Retrigger scheduled for {agent} at {body['fire_at']} (job_id: {body['job_id']}). "
+        "Cancel it with miragen_cancel_retrigger, or list all with miragen_list_retriggers."
+    )
 
 
 @mcp.tool(
     name="miragen_list_retriggers",
     annotations=_annotations("List Scheduled Retriggers", read_only=True, idempotent=True),
 )
-def list_retriggers(
+async def list_retriggers(
     agent: Annotated[
         str | None,
         Field(
@@ -1518,38 +986,24 @@ def list_retriggers(
 
     Returns: {"count": int, "retriggers": [{"job_id", "agent", "fire_at" (ISO 8601, or null
     if the job is paused), "prompt_preview" (first 200 chars)}, ...]}. Retriggers persist
-    across restarts, so this reflects everything still pending. Cancel one with
+    across daemon restarts, so this reflects everything still pending. Cancel one with
     miragen_cancel_retrigger. On an invalid `agent` returns {"error": "ERROR: ..."}.
     """
+    params = None
     if agent is not None:
         err = _check_agent_name(agent)
         if err:
             return {"error": err}
-    prefix = f"retrigger-{agent}-" if agent is not None else "retrigger-"
-    retriggers = []
-    for job in _scheduler.get_jobs():
-        if not job.id.startswith(prefix):
-            continue
-        prompt_preview = ""
-        if job.args and len(job.args) > 1:
-            prompt_preview = str(job.args[1])[:200]
-        next_run = getattr(job, "next_run_time", None)
-        retriggers.append(
-            {
-                "job_id": job.id,
-                "agent": _retrigger_agent(job.id),
-                "fire_at": next_run.isoformat() if next_run else None,
-                "prompt_preview": prompt_preview,
-            }
-        )
-    return {"count": len(retriggers), "retriggers": retriggers}
+        params = {"agent": agent}
+    body, err = await _daemon_request("GET", "/schedules", params=params)
+    return body if err is None else {"error": err}
 
 
 @mcp.tool(
     name="miragen_cancel_retrigger",
     annotations=_annotations("Cancel Scheduled Retrigger", destructive=False, idempotent=True),
 )
-def cancel_retrigger(
+async def cancel_retrigger(
     job_id: Annotated[
         str,
         Field(
@@ -1563,15 +1017,10 @@ def cancel_retrigger(
     Use miragen_list_retriggers to find job ids. Returns "Retrigger <job_id> cancelled." or,
     if there is no such job, an actionable "ERROR: ..." naming miragen_list_retriggers.
     """
-    try:
-        _scheduler.remove_job(job_id)
-        return f"Retrigger '{job_id}' cancelled."
-    except JobLookupError:
-        return (
-            f"ERROR: no retrigger '{job_id}'. Use miragen_list_retriggers to see scheduled jobs."
-        )
-    except Exception as exc:
-        return f"ERROR: {exc}"
+    _, err = await _daemon_request("DELETE", f"/schedules/{job_id}")
+    if err:
+        return err
+    return f"Retrigger '{job_id}' cancelled."
 
 
 # ---- Agent communication ----------------------------------------------------
@@ -1962,17 +1411,6 @@ def get_miragen_readme() -> str:
         return f"ERROR: could not fetch README: {exc}. Retry, or check network access from the MCP server."
 
 
-def _local_miragen_version() -> str | None:
-    """Version of the miragen package installed in THIS container (used by
-    `miragen validate`) — can differ from what the agent containers run."""
-    try:
-        from importlib.metadata import version
-
-        return version("miragen")
-    except Exception:
-        return None
-
-
 @mcp.tool(
     name="miragen_check_deployment",
     annotations=_annotations("Check Deployment Compatibility", read_only=True, idempotent=True),
@@ -1982,12 +1420,13 @@ async def check_deployment(agent: AgentName) -> dict:
     agent, compared against what this MCP server supports.
 
     Returns {"agent", "deployed_version", "deployed_capabilities",
-    "mcp_local_miragen_version" (the version `miragen validate` uses here),
-    "supported_capabilities", "missing" (supported here but absent from the
-    deployment), "extra" (advertised but unknown to this server — usually a newer
-    miragen), "compatible", "notes"}. Run this before relying on the executor-run
-    or EDF contract tools; "missing" names exactly which surfaces will not work.
-    On failure returns {"error": "ERROR: ..."}.
+    "daemon_miragen_version" (the miragend lifecycle daemon's own miragen version,
+    null if the daemon is unreachable), "supported_capabilities", "missing"
+    (supported here but absent from the deployment), "extra" (advertised but
+    unknown to this server — usually a newer miragen), "compatible", "notes"}.
+    Run this before relying on the executor-run or EDF contract tools; "missing"
+    names exactly which surfaces will not work. On failure returns
+    {"error": "ERROR: ..."}.
     """
     err = _check_agent_name(agent)
     if err:
@@ -1997,6 +1436,11 @@ async def check_deployment(agent: AgentName) -> dict:
         return {"error": err}
     if not isinstance(health, dict):
         return {"error": f"ERROR: unexpected /health response from '{agent}': {str(health)[:200]}"}
+
+    daemon_health, _daemon_err = await _daemon_request("GET", "/health", timeout=10)
+    daemon_version = (
+        daemon_health.get("version") if isinstance(daemon_health, dict) else None
+    )
 
     deployed_version = health.get("version")
     deployed_capabilities = health.get("capabilities") or []
@@ -2028,7 +1472,7 @@ async def check_deployment(agent: AgentName) -> dict:
         "agent": agent,
         "deployed_version": deployed_version,
         "deployed_capabilities": deployed_capabilities,
-        "mcp_local_miragen_version": _local_miragen_version(),
+        "daemon_miragen_version": daemon_version,
         "supported_capabilities": sorted(SUPPORTED_CONTRACT_CAPABILITIES),
         "missing": missing,
         "extra": extra,
@@ -2098,7 +1542,7 @@ def get_miragen_doc(
     name="miragen_validate_yaml",
     annotations=_annotations("Validate Agent YAML", read_only=True, idempotent=True),
 )
-def validate_yaml(
+async def validate_yaml(
     source: Annotated[
         str,
         Field(
@@ -2107,25 +1551,26 @@ def validate_yaml(
         ),
     ],
 ) -> str:
-    """Validate a miragen agent profile YAML using the miragen CLI, without creating or
+    """Validate a miragen agent profile YAML via the miragend daemon, without creating or
     touching any agent.
 
     Use this to check drafts before miragen_create_agent. Returns the validator's verdict —
     a summary of the parsed profile if valid, otherwise the specific schema errors to fix.
     """
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False
-    ) as f:
-        f.write(source)
-        tmp = Path(f.name)
-    try:
-        result = subprocess.run(
-            ["miragen", "validate", str(tmp)],
-            capture_output=True, text=True, cwd=WORKSPACE,
-        )
-        return (result.stdout + result.stderr).strip() or "OK"
-    finally:
-        tmp.unlink(missing_ok=True)
+    body, err = await _daemon_request("POST", "/validate", json_body={"yaml_source": source})
+    if err:
+        return err
+    profile = body.get("profile", {}) if isinstance(body, dict) else {}
+    lines = [f"✓ '{profile.get('name')}' is valid"]
+    lines.append(f"  mode:         {profile.get('mode')}")
+    if "executor" in profile:
+        lines.append(f"  executor:     {profile.get('executor')}")
+    else:
+        lines.append(f"  model:        {profile.get('model')}")
+        lines.append(f"  capabilities: {profile.get('capabilities') or []}")
+    lines.append(f"  triggers:     {profile.get('triggers') or []}")
+    lines.append(f"  tools:        {profile.get('tools') or []}")
+    return "\n".join(lines)
 
 
 # ---- Resources ---------------------------------------------------------------
@@ -2161,9 +1606,9 @@ Validate any draft with miragen_validate_yaml before miragen_create_agent.
     description="JSON list of every miragen agent in the workspace (same data as miragen_list_agents).",
     mime_type="application/json",
 )
-def agents_resource() -> dict:
+async def agents_resource() -> dict:
     """Expose the agent list as a browsable resource. Mirrors miragen_list_agents."""
-    return list_agents()
+    return await list_agents()
 
 
 @mcp.resource(
@@ -2172,23 +1617,21 @@ def agents_resource() -> dict:
     description="Raw agent.yaml contents for one agent.",
     mime_type="text/yaml",
 )
-def agent_yaml_resource(name: AgentName) -> str:
+async def agent_yaml_resource(name: AgentName) -> str:
     """Raw agent.yaml text for `name` (same bytes as miragen_read_agent_file for that path).
 
-    Raises ValueError if `name` is invalid or no such agent exists, FileNotFoundError if
-    the agent exists but has no agent.yaml.
+    Raises ValueError if `name` is invalid, no such agent exists, or the agent has no
+    agent.yaml (the daemon reports which).
     """
     err = _check_agent_name(name)
     if err:
         raise ValueError(err)
-    if not _agent_dir(name).exists():
-        raise ValueError(f"agent '{name}' not found. Read miragen://agents to see existing agents.")
-    full, path_err = _safe_path(name, "agent.yaml")
-    if path_err:
-        raise ValueError(path_err)
-    if not full.exists():
-        raise FileNotFoundError(f"agent.yaml not found for agent '{name}'.")
-    return full.read_text()
+    body, err = await _daemon_request(
+        "GET", f"/agents/{name}/files", params={"path": "agent.yaml"}
+    )
+    if err:
+        raise ValueError(err)
+    return body.get("content", "") if isinstance(body, dict) else str(body)
 
 
 @mcp.resource(
@@ -2197,7 +1640,7 @@ def agent_yaml_resource(name: AgentName) -> str:
     description="Raw tools.py contents for one agent.",
     mime_type="text/x-python",
 )
-def agent_tools_resource(name: AgentName) -> str:
+async def agent_tools_resource(name: AgentName) -> str:
     """Raw tools.py text for `name` (same bytes as miragen_read_agent_file for that path).
 
     Same error conventions as the agent.yaml resource above.
@@ -2205,14 +1648,12 @@ def agent_tools_resource(name: AgentName) -> str:
     err = _check_agent_name(name)
     if err:
         raise ValueError(err)
-    if not _agent_dir(name).exists():
-        raise ValueError(f"agent '{name}' not found. Read miragen://agents to see existing agents.")
-    full, path_err = _safe_path(name, "tools.py")
-    if path_err:
-        raise ValueError(path_err)
-    if not full.exists():
-        raise FileNotFoundError(f"tools.py not found for agent '{name}'.")
-    return full.read_text()
+    body, err = await _daemon_request(
+        "GET", f"/agents/{name}/files", params={"path": "tools.py"}
+    )
+    if err:
+        raise ValueError(err)
+    return body.get("content", "") if isinstance(body, dict) else str(body)
 
 
 @mcp.resource(
@@ -2290,11 +1731,11 @@ if not NO_AUTH:
         if os.getenv("MCP_ALLOW_DEFAULT_SECRET", "false").lower() != "true":
             raise RuntimeError(
                 "MCP_CLIENT_SECRET is unset and defaulting to the well-known value 'changeme' "
-                "while auth is enabled (MCP_NO_AUTH is not 'true'). This server holds the "
-                "Docker socket -- starting with a publicly-known OAuth client secret is a full "
-                "compromise waiting to happen. Set MCP_CLIENT_SECRET to a real secret, set "
-                "MCP_NO_AUTH=true for local development without auth, or set "
-                "MCP_ALLOW_DEFAULT_SECRET=true to acknowledge the risk and start anyway."
+                "while auth is enabled (MCP_NO_AUTH is not 'true'). This server fronts the "
+                "miragend lifecycle daemon -- starting with a publicly-known OAuth client "
+                "secret is a full swarm compromise waiting to happen. Set MCP_CLIENT_SECRET "
+                "to a real secret, set MCP_NO_AUTH=true for local development without auth, "
+                "or set MCP_ALLOW_DEFAULT_SECRET=true to acknowledge the risk and start anyway."
             )
         logger.warning(
             "MCP_CLIENT_SECRET is unset and defaulting to the well-known value 'changeme' "
@@ -2328,23 +1769,6 @@ if not NO_AUTH:
     for _key, _value in vars(oauth_app.state)["_state"].items():
         setattr(app.state, _key, _value)
 
-
-_original_lifespan = app.router.lifespan_context
-
-
-@asynccontextmanager
-async def _lifespan(scope):
-    async with _original_lifespan(scope):
-        # The persistent retrigger store writes retriggers.sqlite here, so the
-        # workspace must exist before the scheduler starts.
-        WORKSPACE.mkdir(parents=True, exist_ok=True)
-        _ensure_agent_network()
-        _scheduler.start()
-        yield
-        _scheduler.shutdown(wait=False)
-
-
-app.router.lifespan_context = _lifespan
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

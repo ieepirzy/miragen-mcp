@@ -1,1156 +1,505 @@
+"""The thin-adapter contract: every lifecycle/schedule/validate tool composes
+the right daemon request, maps daemon error codes to LLM-facing guidance, and
+preserves its historical success strings. The daemon is faked with an
+httpx.MockTransport installed on server._daemon_transport — the same seam
+pattern test_run_tools.py uses for agent traffic."""
+
+import asyncio
+import json
+
+import httpx
 import pytest
+
 import server
+
+
+# ── fake daemon ───────────────────────────────────────────────────────────────
+
+
+class FakeDaemon:
+    """Programmable daemon: records every request, answers from a route table."""
+
+    def __init__(self):
+        self.requests: list[httpx.Request] = []
+        self.routes: dict[tuple[str, str], tuple[int, dict]] = {}
+        self.raise_connect_error = False
+
+    def route(self, method: str, path: str, status: int, body: dict):
+        self.routes[(method, path)] = (status, body)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.raise_connect_error:
+            raise httpx.ConnectError("boom", request=request)
+        key = (request.method, request.url.path)
+        if key not in self.routes:
+            return httpx.Response(500, json={"detail": f"unrouted: {key}"})
+        status, body = self.routes[key]
+        return httpx.Response(status, json=body)
+
+    def last(self) -> httpx.Request:
+        return self.requests[-1]
+
+    def last_json(self) -> dict:
+        return json.loads(self.last().content)
+
+
+@pytest.fixture
+def daemon(monkeypatch):
+    fake = FakeDaemon()
+    monkeypatch.setattr(
+        server, "_daemon_transport", httpx.MockTransport(fake.handler)
+    )
+    monkeypatch.setattr(server, "MIRAGEND_TOKEN", "test-daemon-token")
+    return fake
+
+
+def run(coro):
+    return asyncio.run(coro)
 
 
 # ── import smoke test ─────────────────────────────────────────────────────────
 
+
 def test_module_imports():
-    """Server module loads without errors (catches startup AttributeErrors)."""
-    assert server.app is not None
+    assert server.mcp is not None
+    assert server.MIRAGEND_URL.startswith("http")
 
 
-# ── _safe_path ────────────────────────────────────────────────────────────────
-
-def test_safe_path_normal(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    full, err = server._safe_path("agent", "subdir/file.txt")
-    assert err is None
-    assert full == (tmp_path / "agents" / "agent" / "subdir" / "file.txt").resolve()
+# ── request composition & auth ───────────────────────────────────────────────
 
 
-def test_safe_path_dotdot(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    _, err = server._safe_path("agent", "../other/secret.txt")
-    assert err == "ERROR: path traversal not allowed"
+def test_list_agents_hits_daemon_with_bearer_token(daemon):
+    daemon.route("GET", "/agents", 200, {"count": 0, "agents": []})
+    result = run(server.list_agents())
+    assert result == {"count": 0, "agents": []}
+    assert daemon.last().headers["authorization"] == "Bearer test-daemon-token"
 
 
-def test_safe_path_absolute(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    _, err = server._safe_path("agent", "/etc/passwd")
-    assert err == "ERROR: path traversal not allowed"
+def test_empty_token_sends_no_auth_header(daemon, monkeypatch):
+    monkeypatch.setattr(server, "MIRAGEND_TOKEN", "")
+    daemon.route("GET", "/agents", 200, {"count": 0, "agents": []})
+    run(server.list_agents())
+    assert "authorization" not in daemon.last().headers
 
 
-def test_safe_path_nested_dotdot(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    _, err = server._safe_path("agent", "sub/../../escape")
-    assert err == "ERROR: path traversal not allowed"
+def test_create_agent_posts_name_and_yaml(daemon):
+    daemon.route("POST", "/agents", 201, {"name": "a", "status": "running"})
+    result = run(server.create_agent("a", "name: a\n"))
+    assert result.startswith("Agent a created and started.")
+    assert daemon.last_json() == {"name": "a", "yaml_source": "name: a\n"}
 
 
-# ── _parse_registered_tools ───────────────────────────────────────────────────
+def test_lifecycle_success_strings(daemon):
+    daemon.route("POST", "/agents/a/start", 200, {"name": "a", "status": "running"})
+    daemon.route("POST", "/agents/a/stop", 200, {"name": "a", "status": "exited"})
+    daemon.route("POST", "/agents/a/restart", 200, {"name": "a", "status": "running"})
+    daemon.route("DELETE", "/agents/a", 200, {"name": "a", "deleted": True})
 
-def test_parse_plain_decorator():
-    tools = server._parse_registered_tools(
-        "from miragen import register\n\n"
-        "@register\nasync def do_thing(ctx, x: str) -> str:\n"
-        '    """Does a thing."""\n    return x\n'
+    assert run(server.start_agent("a")) == "Agent a started."
+    assert run(server.stop_agent("a")) == "Agent a stopped."
+    assert run(server.restart_agent("a")) == "Agent a restarted."
+    assert run(server.delete_agent("a")) == "Agent a deleted."
+
+
+def test_update_agent_config_diff_summary(daemon):
+    daemon.route("PUT", "/agents/a/config", 200, {"changed_keys": ["mode", "spec"]})
+    result = run(server.update_agent_config("a", "name: a\n"))
+    assert result == "Config updated and a restarted. Diff summary: mode, spec"
+
+    daemon.route("PUT", "/agents/a/config", 200, {"changed_keys": []})
+    result = run(server.update_agent_config("a", "name: a\n"))
+    assert "(no top-level keys changed)" in result
+
+
+# ── error mapping ─────────────────────────────────────────────────────────────
+
+
+def test_agent_not_found_maps_to_list_agents_guidance(daemon):
+    daemon.route(
+        "GET", "/agents/ghost", 404,
+        {"detail": "agent 'ghost' not found", "code": "agent_not_found"},
     )
-    assert len(tools) == 1
-    assert tools[0]["name"] == "do_thing"
-    assert tools[0]["description"] == "Does a thing."
-    assert "ctx" in tools[0]["signature"]
+    result = run(server.get_agent("ghost"))
+    assert result["error"].startswith("ERROR: agent 'ghost' not found")
+    assert "miragen_list_agents" in result["error"]
 
 
-def test_parse_named_decorator():
-    tools = server._parse_registered_tools(
-        "from miragen import register\n\n"
-        '@register("speak_aloud")\nasync def tts(ctx, text: str) -> None:\n    pass\n'
+def test_agent_exists_maps_to_delete_guidance(daemon):
+    daemon.route(
+        "POST", "/agents", 409,
+        {"detail": "agent 'a' already exists", "code": "agent_exists"},
     )
-    assert len(tools) == 1
-    assert tools[0]["name"] == "speak_aloud"
+    result = run(server.create_agent("a", "name: a\n"))
+    assert result.startswith("ERROR: agent 'a' already exists")
+    assert "miragen_delete_agent" in result
 
 
-def test_parse_ignores_sync_functions():
-    tools = server._parse_registered_tools(
-        "@register\ndef sync_fn(ctx):\n    pass\n"
+def test_validation_failure_passes_daemon_detail_through(daemon):
+    detail = "Invalid profile — 1 error(s):\n  mode: unknown field"
+    daemon.route(
+        "POST", "/agents", 422, {"detail": detail, "code": "validation_failed"}
     )
-    assert tools == []
+    result = run(server.create_agent("a", "nope: 1\n"))
+    assert detail in result
+    assert "miragen_validate_yaml" in result
 
 
-def test_parse_ignores_undecorated():
-    tools = server._parse_registered_tools(
-        "async def bare(ctx):\n    pass\n"
+def test_job_not_found_maps_to_list_retriggers_guidance(daemon):
+    daemon.route(
+        "DELETE", "/schedules/retrigger-a-1", 404,
+        {"detail": "no retrigger 'retrigger-a-1'", "code": "job_not_found"},
     )
-    assert tools == []
+    result = run(server.cancel_retrigger("retrigger-a-1"))
+    assert "miragen_list_retriggers" in result
 
 
-def test_parse_multiple_tools():
-    src = (
-        "from miragen import register\n\n"
-        "@register\nasync def alpha(ctx): pass\n\n"
-        "@register\nasync def beta(ctx): pass\n"
+def test_daemon_unreachable_reports_daemon_not_agent(daemon):
+    daemon.raise_connect_error = True
+    result = run(server.start_agent("a"))
+    assert "could not reach the miragend lifecycle daemon" in result
+    assert server.MIRAGEND_URL in result
+
+
+def test_unauthorized_names_token_mismatch(daemon):
+    daemon.route(
+        "GET", "/agents", 401,
+        {"detail": "missing or invalid bearer token", "code": "unauthorized"},
     )
-    tools = server._parse_registered_tools(src)
-    assert [t["name"] for t in tools] == ["alpha", "beta"]
+    result = run(server.list_agents())
+    assert "MIRAGEND_TOKEN" in result["error"]
 
 
-def test_parse_invalid_syntax():
-    assert server._parse_registered_tools("def (broken:") == []
+# ── client-side name validation (no round trip) ──────────────────────────────
 
 
-# ── _find_function_span ───────────────────────────────────────────────────────
-
-def test_find_span_second_function():
-    src = (
-        "from miragen import register\n\n"
-        "@register\nasync def first(ctx):\n    return 1\n\n"
-        "@register\nasync def second(ctx):\n    return 2\n"
-    )
-    span = server._find_function_span(src, "second")
-    assert span is not None
-    chunk = "\n".join(src.splitlines()[span[0]:span[1]])
-    assert "second" in chunk
-    assert "first" not in chunk
+@pytest.mark.parametrize("bad", ["UPPER", "-lead", "a b", "a" * 64, "../x"])
+def test_invalid_agent_names_rejected_without_daemon_call(daemon, bad):
+    result = run(server.get_agent(bad))
+    assert result["error"].startswith("ERROR: invalid agent name")
+    assert daemon.requests == []
 
 
-def test_find_span_missing():
-    assert server._find_function_span("async def foo(): pass\n", "bar") is None
-
-
-def test_find_span_invalid_syntax():
-    assert server._find_function_span("def (broken:", "foo") is None
-
-
-# ── read_agent_file / write_agent_file / edit_agent_file ──────────────────────
-
-def test_read_agent_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "data.txt").write_text("hello")
-    assert server.read_agent_file("a", "data.txt") == "hello"
-
-
-def test_read_agent_file_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents" / "a").mkdir(parents=True)
-    assert server.read_agent_file("a", "nope.txt").startswith("ERROR:")
-
-
-def test_read_agent_file_traversal(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    assert server.read_agent_file("a", "../b/secret.txt").startswith("ERROR:")
-
-
-def test_write_agent_file_creates_parents(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents" / "a").mkdir(parents=True)
-    server.write_agent_file("a", "sub/out.txt", "content")
-    assert (tmp_path / "agents" / "a" / "sub" / "out.txt").read_text() == "content"
-
-
-def test_edit_agent_file_success(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "f.txt").write_text("foo bar baz")
-    assert server.edit_agent_file("a", "f.txt", "bar", "qux") == "Edited f.txt"
-    assert (d / "f.txt").read_text() == "foo qux baz"
-
-
-def test_edit_agent_file_no_match(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "f.txt").write_text("hello")
-    assert server.edit_agent_file("a", "f.txt", "nope", "x").startswith("ERROR:")
-
-
-def test_edit_agent_file_ambiguous(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "f.txt").write_text("x x x")
-    result = server.edit_agent_file("a", "f.txt", "x", "y")
-    assert "3 times" in result
-
-
-def test_edit_agent_file_missing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents" / "a").mkdir(parents=True)
-    assert server.edit_agent_file("a", "missing.txt", "x", "y").startswith("ERROR:")
-
-
-# ── set_retrigger arg validation ──────────────────────────────────────────────
-
-def test_retrigger_neither_arg():
-    assert server.set_retrigger("agent", "do something").startswith("ERROR:")
-
-
-def test_retrigger_both_args():
-    assert server.set_retrigger("agent", "do something", delay_seconds=10, at="2030-01-01T00:00:00").startswith("ERROR:")
-
-
-def test_retrigger_delay(monkeypatch):
-    monkeypatch.setattr(server, "_scheduler", pytest.importorskip("unittest.mock").MagicMock())
-    result = server.set_retrigger("agent", "do something", delay_seconds=60)
-    assert "agent" in result
-    assert result.startswith("Retrigger scheduled")
-
-
-# ── register_tool rollback ────────────────────────────────────────────────────
-
-def test_register_tool_rollback_on_restart_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "restart_agent", lambda name: "ERROR: container not found")
-
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    orig_tools = "from miragen import register\n\n# Tools for a\n"
-    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
-    (d / "tools.py").write_text(orig_tools)
-    (d / "agent.yaml").write_text(orig_yaml)
-
-    result = server.register_tool("a", "new_tool", "@register\nasync def new_tool(ctx): pass\n")
-
-    assert result.startswith("ERROR:")
-    assert (d / "tools.py").read_text() == orig_tools
-    assert (d / "agent.yaml").read_text() == orig_yaml
-
-
-def test_register_tool_success(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
-
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text("from miragen import register\n\n# Tools for a\n")
-    (d / "agent.yaml").write_text("name: a\nmode: autonomous\ntools: []\n")
-
-    result = server.register_tool("a", "my_tool", "@register\nasync def my_tool(ctx): pass\n")
-    assert "registered" in result
-    assert "my_tool" in (d / "tools.py").read_text()
-    yaml_data = server._read_yaml(d / "agent.yaml")
-    assert "my_tool" in yaml_data["tools"]
-
-
-# ── agent name validation ─────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("bad", ["../escape", "UPPER", "has space", "", ".hidden", "a/b"])
-def test_invalid_agent_names_rejected(bad):
-    assert server._check_agent_name(bad) is not None
-
-
-@pytest.mark.parametrize("good", ["a", "morning-briefing", "agent_2", "0abc"])
+@pytest.mark.parametrize("good", ["a", "morning-briefing", "x1_y2", "a" * 63])
 def test_valid_agent_names_accepted(good):
     assert server._check_agent_name(good) is None
 
 
-def test_read_agent_file_agent_name_traversal(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "secret.txt").write_text("top secret")
-    result = server.read_agent_file("..", "secret.txt")
-    assert result.startswith("ERROR:")
+# ── tools ─────────────────────────────────────────────────────────────────────
 
 
-def test_get_agent_invalid_name():
-    result = server.get_agent("../../etc")
-    assert "error" in result
-    assert result["error"].startswith("ERROR:")
+def test_register_tool_success_string_and_payload(daemon):
+    daemon.route(
+        "POST", "/agents/a/tools", 201, {"tool_name": "greet", "registered": True}
+    )
+    src = "@register\nasync def greet(ctx): ..."
+    result = run(server.register_tool("a", "greet", src))
+    assert result == "Tool greet registered on a and agent restarted."
+    assert daemon.last_json() == {"tool_name": "greet", "source": src}
 
 
-def test_create_agent_invalid_name():
-    assert server.create_agent("Bad Name", "name: x").startswith("ERROR:")
+def test_edit_tool_conflict_guidance(daemon):
+    daemon.route(
+        "PATCH", "/agents/a/tools/greet", 409,
+        {
+            "detail": "old_str appears 2 times within tool 'greet' — must be unique",
+            "code": "edit_conflict",
+            "occurrences": 2,
+        },
+    )
+    result = run(server.edit_tool("a", "greet", "x", "y"))
+    assert "must be unique" in result
+    assert "surrounding context" in result
 
 
-# ── register_tool source validation ──────────────────────────────────────────
-
-def test_register_tool_rejects_invalid_syntax(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    orig = "from miragen import register\n"
-    (d / "tools.py").write_text(orig)
-    result = server.register_tool("a", "broken", "def (broken:")
-    assert result.startswith("ERROR:")
-    assert "valid Python" in result
-    assert (d / "tools.py").read_text() == orig
+def test_delete_tool_returns_restart_message(daemon):
+    daemon.route(
+        "DELETE", "/agents/a/tools/greet", 200, {"tool_name": "greet", "deleted": True}
+    )
+    assert run(server.delete_tool("a", "greet")) == "Agent a restarted."
 
 
-def test_register_tool_rejects_name_mismatch(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    orig = "from miragen import register\n"
-    (d / "tools.py").write_text(orig)
-    result = server.register_tool("a", "expected", "@register\nasync def other(ctx): pass\n")
-    assert result.startswith("ERROR:")
-    assert "expected" in result
-    assert (d / "tools.py").read_text() == orig
+def test_get_tool_source_unwraps_source(daemon):
+    daemon.route(
+        "GET", "/agents/a/tools/greet", 200,
+        {"tool_name": "greet", "source": "@register\nasync def greet(ctx): ..."},
+    )
+    assert run(server.get_tool_source("a", "greet")).startswith("@register")
 
 
-def test_register_tool_accepts_named_decorator(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text("from miragen import register\n")
-    (d / "agent.yaml").write_text("name: a\ntools: []\n")
-    result = server.register_tool("a", "speak", '@register("speak")\nasync def tts(ctx, text: str): pass\n')
-    assert "registered" in result
+# ── files ─────────────────────────────────────────────────────────────────────
 
 
-# ── output truncation ─────────────────────────────────────────────────────────
-
-def test_truncate_short_passthrough():
-    assert server._truncate("abc") == "abc"
-
-
-def test_truncate_long_output():
-    result = server._truncate("x" * 60_000)
+def test_read_agent_file_unwraps_and_truncates(daemon):
+    daemon.route(
+        "GET", "/agents/a/files", 200, {"path": "big.txt", "content": "x" * 60_000}
+    )
+    result = run(server.read_agent_file("a", "big.txt"))
     assert len(result) < 60_000
     assert "TRUNCATED" in result
 
 
-def test_read_agent_file_truncates(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "big.txt").write_text("y" * (server.MAX_OUTPUT_CHARS + 1000))
-    result = server.read_agent_file("a", "big.txt")
+def test_write_agent_file_yaml_note(daemon):
+    daemon.route("PUT", "/agents/a/files", 200, {"path": "agent.yaml", "written": True})
+    result = run(server.write_agent_file("a", "agent.yaml", "name: a\n"))
+    assert result.startswith("Written agent.yaml")
+    assert "bypassed validation" in result
+
+    daemon.route("PUT", "/agents/a/files", 200, {"path": "notes.md", "written": True})
+    result = run(server.write_agent_file("a", "notes.md", "hi"))
+    assert result == "Written notes.md"
+
+
+def test_edit_agent_file_yaml_note(daemon):
+    daemon.route("PATCH", "/agents/a/files", 200, {"path": "agent.yaml", "edited": True})
+    result = run(server.edit_agent_file("a", "agent.yaml", "x", "y"))
+    assert result.startswith("Edited agent.yaml")
+    assert "bypassed validation" in result
+
+
+def test_get_agent_logs_unwraps_and_truncates(daemon):
+    daemon.route("GET", "/agents/a/logs", 200, {"name": "a", "logs": "y" * 60_000})
+    result = run(server.get_agent_logs("a", tail=100))
     assert "TRUNCATED" in result
+    assert daemon.last().url.params["tail"] == "100"
 
 
-# ── set_retrigger datetime validation ─────────────────────────────────────────
-
-def test_retrigger_invalid_iso():
-    result = server.set_retrigger("agent", "go", at="not-a-date")
-    assert result.startswith("ERROR:")
-    assert "ISO 8601" in result
+# ── export / import ───────────────────────────────────────────────────────────
 
 
-def test_retrigger_past_datetime():
-    result = server.set_retrigger("agent", "go", at="2000-01-01T00:00:00+00:00")
-    assert result.startswith("ERROR:")
-    assert "past" in result
+def test_export_agent_adds_client_side_hint(daemon):
+    daemon.route(
+        "POST", "/agents/a/export", 200,
+        {
+            "agent": "a",
+            "archive_path": "/opt/miragen/exports/a-20260805-120000.tar.gz",
+            "included": ["agent.yaml"],
+            "skipped": [],
+            "size_bytes": 123,
+        },
+    )
+    result = run(server.export_agent("a"))
+    assert "exports/a-20260805-120000.tar.gz" in result["hint"]
+    assert "miragen_import_agent" in result["hint"]
 
 
-# ── set_retrigger job id + persistence knobs ──────────────────────────────────
+def test_import_agent_success_strings(daemon):
+    daemon.route(
+        "POST", "/agents/import", 201,
+        {"name": "b", "imported": True, "started": True},
+    )
+    result = run(server.import_agent("b", "exports/a-1.tar.gz"))
+    assert result.startswith("Agent b imported from a-1.tar.gz and started.")
+    assert daemon.last_json() == {
+        "name": "b", "archive_path": "exports/a-1.tar.gz", "start": True,
+    }
 
-def test_retrigger_success_reports_job_id_and_grace(monkeypatch):
-    from unittest.mock import MagicMock
-
-    sched = MagicMock()
-    monkeypatch.setattr(server, "_scheduler", sched)
-    result = server.set_retrigger("worker", "do something", delay_seconds=60)
-
-    assert result.startswith("Retrigger scheduled")
-    assert "job_id: retrigger-worker-" in result
-    assert "miragen_cancel_retrigger" in result
-    # persistence knobs are passed through to APScheduler
-    _, kwargs = sched.add_job.call_args
-    assert kwargs["misfire_grace_time"] == server.RETRIGGER_MISFIRE_GRACE
-    assert kwargs["id"].startswith("retrigger-worker-")
+    result = run(server.import_agent("b", "exports/a-1.tar.gz", start=False))
+    assert "not started; use miragen_start_agent" in result
+    assert daemon.last_json()["start"] is False
 
 
-# ── _retrigger_agent parsing (hyphenated names) ───────────────────────────────
-
-@pytest.mark.parametrize("job_id,expected", [
-    ("retrigger-worker-1751450000", "worker"),
-    ("retrigger-my-hyphenated-agent-1751450000", "my-hyphenated-agent"),
-    ("retrigger-a_b-1751450000", "a_b"),
-    ("not-a-retrigger", None),
-    ("retrigger-worker", None),
-])
-def test_retrigger_agent_parsing(job_id, expected):
-    assert server._retrigger_agent(job_id) == expected
+# ── schedules ─────────────────────────────────────────────────────────────────
 
 
-# ── list_retriggers ───────────────────────────────────────────────────────────
-
-def _fake_job(job_id, args, next_run="2030-01-01T00:00:00+00:00"):
-    from datetime import datetime
-    from unittest.mock import MagicMock
-
-    job = MagicMock()
-    job.id = job_id
-    job.args = args
-    job.next_run_time = datetime.fromisoformat(next_run) if next_run else None
-    return job
-
-
-def test_list_retriggers_all_and_preview(monkeypatch):
-    from unittest.mock import MagicMock
-
-    sched = MagicMock()
-    sched.get_jobs.return_value = [
-        _fake_job("retrigger-worker-1751450000", ["worker", "hello world"]),
-        _fake_job("retrigger-scribe-1751460000", ["scribe", "x" * 500]),
-        _fake_job("some-other-job", ["irrelevant"]),  # not a retrigger, filtered out
-    ]
-    monkeypatch.setattr(server, "_scheduler", sched)
-
-    result = server.list_retriggers()
-    assert result["count"] == 2
-    ids = {r["job_id"] for r in result["retriggers"]}
-    assert ids == {"retrigger-worker-1751450000", "retrigger-scribe-1751460000"}
-    worker = next(r for r in result["retriggers"] if r["agent"] == "worker")
-    assert worker["prompt_preview"] == "hello world"
-    assert worker["fire_at"] == "2030-01-01T00:00:00+00:00"
-    scribe = next(r for r in result["retriggers"] if r["agent"] == "scribe")
-    assert len(scribe["prompt_preview"]) == 200
+def test_set_retrigger_delegates_and_reports(daemon):
+    daemon.route(
+        "POST", "/schedules", 201,
+        {
+            "job_id": "retrigger-a-1700000000",
+            "agent": "a",
+            "fire_at": "2026-08-05T13:00:00+00:00",
+        },
+    )
+    result = run(server.set_retrigger("a", "wake up", delay_seconds=60))
+    assert "Retrigger scheduled for a at 2026-08-05T13:00:00+00:00" in result
+    assert "job_id: retrigger-a-1700000000" in result
+    assert daemon.last_json() == {"agent": "a", "prompt": "wake up", "delay_seconds": 60}
 
 
-def test_list_retriggers_filters_by_agent(monkeypatch):
-    from unittest.mock import MagicMock
-
-    sched = MagicMock()
-    sched.get_jobs.return_value = [
-        _fake_job("retrigger-worker-1751450000", ["worker", "a"]),
-        _fake_job("retrigger-worker2-1751460000", ["worker2", "b"]),
-    ]
-    monkeypatch.setattr(server, "_scheduler", sched)
-
-    result = server.list_retriggers(agent="worker")
-    # prefix "retrigger-worker-" must not also match "retrigger-worker2-"
-    assert result["count"] == 1
-    assert result["retriggers"][0]["agent"] == "worker"
+def test_set_retrigger_neither_or_both_args_rejected_locally(daemon):
+    assert "exactly one" in run(server.set_retrigger("a", "x"))
+    assert "exactly one" in run(
+        server.set_retrigger("a", "x", delay_seconds=5, at="2030-01-01T00:00:00")
+    )
+    assert daemon.requests == []
 
 
-def test_list_retriggers_invalid_agent():
-    result = server.list_retriggers(agent="Bad Name!")
+def test_list_retriggers_filters_by_agent(daemon):
+    daemon.route("GET", "/schedules", 200, {"count": 0, "retriggers": []})
+    run(server.list_retriggers("a"))
+    assert daemon.last().url.params["agent"] == "a"
+
+    run(server.list_retriggers())
+    assert "agent" not in daemon.last().url.params
+
+
+def test_list_retriggers_invalid_agent(daemon):
+    result = run(server.list_retriggers("NOT-VALID"))
     assert result["error"].startswith("ERROR: invalid agent name")
+    assert daemon.requests == []
 
 
-def test_list_retriggers_handles_paused_job(monkeypatch):
-    from unittest.mock import MagicMock
-
-    sched = MagicMock()
-    sched.get_jobs.return_value = [
-        _fake_job("retrigger-worker-1751450000", ["worker", "a"], next_run=None),
-    ]
-    monkeypatch.setattr(server, "_scheduler", sched)
-    result = server.list_retriggers()
-    assert result["retriggers"][0]["fire_at"] is None
-
-
-# ── cancel_retrigger ──────────────────────────────────────────────────────────
-
-def test_cancel_retrigger_success(monkeypatch):
-    from unittest.mock import MagicMock
-
-    sched = MagicMock()
-    monkeypatch.setattr(server, "_scheduler", sched)
-    result = server.cancel_retrigger("retrigger-worker-1751450000")
-    assert result == "Retrigger 'retrigger-worker-1751450000' cancelled."
-    sched.remove_job.assert_called_once_with("retrigger-worker-1751450000")
-
-
-def test_cancel_retrigger_unknown_id(monkeypatch):
-    from unittest.mock import MagicMock
-
-    sched = MagicMock()
-    sched.remove_job.side_effect = server.JobLookupError("nope")
-    monkeypatch.setattr(server, "_scheduler", sched)
-    result = server.cancel_retrigger("retrigger-worker-000")
-    assert result.startswith("ERROR: no retrigger")
-    assert "miragen_list_retriggers" in result
-
-
-# ── delete_tool ───────────────────────────────────────────────────────────────
-
-def test_delete_tool_removes_function_and_yaml_entry(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
-
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text(
-        "from miragen import register\n\n"
-        "@register\nasync def keeper(ctx): pass\n\n"
-        "@register\nasync def goner(ctx): pass\n"
+def test_cancel_retrigger_success(daemon):
+    daemon.route(
+        "DELETE", "/schedules/retrigger-a-1", 200,
+        {"job_id": "retrigger-a-1", "cancelled": True},
     )
-    (d / "agent.yaml").write_text("name: a\ntools:\n- keeper\n- goner\n")
-
-    result = server.delete_tool("a", "goner")
-    assert "restarted" in result
-
-    src = (d / "tools.py").read_text()
-    assert "goner" not in src
-    assert "keeper" in src
-
-    tools_list = server._read_yaml(d / "agent.yaml")["tools"]
-    assert "goner" not in tools_list
-    assert "keeper" in tools_list
+    assert run(server.cancel_retrigger("retrigger-a-1")) == "Retrigger 'retrigger-a-1' cancelled."
 
 
-def test_delete_tool_not_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text("from miragen import register\n")
-    result = server.delete_tool("a", "ghost")
-    assert result.startswith("ERROR:")
+# ── validate ─────────────────────────────────────────────────────────────────
 
 
-# ── edit_tool ─────────────────────────────────────────────────────────────────
-
-def test_edit_tool_tool_not_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    original = "from miragen import register\n\n@register\nasync def keeper(ctx):\n    return 1\n"
-    (d / "tools.py").write_text(original)
-
-    result = server.edit_tool("a", "ghost", "return 1", "return 2")
-
-    assert result.startswith("ERROR:")
-    assert "not found" in result
-    assert (d / "tools.py").read_text() == original
-
-
-def test_edit_tool_old_str_outside_named_span(tmp_path, monkeypatch):
-    """old_str is unique in the whole file but lives inside a *different*
-    function than the one named by tool_name — must not edit the wrong tool."""
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    original = (
-        "from miragen import register\n\n"
-        "@register\nasync def alpha(ctx):\n    return 'alpha-marker'\n\n"
-        "@register\nasync def beta(ctx):\n    return 'beta-marker'\n"
+def test_validate_yaml_formats_summary(daemon):
+    daemon.route(
+        "POST", "/validate", 200,
+        {
+            "valid": True,
+            "profile": {
+                "name": "a",
+                "mode": "interactive",
+                "triggers": ["http"],
+                "tools": [],
+                "model": "test:whatever",
+                "capabilities": [],
+            },
+        },
     )
-    (d / "tools.py").write_text(original)
-
-    result = server.edit_tool("a", "beta", "alpha-marker", "hacked")
-
-    assert result.startswith("ERROR:")
-    assert (d / "tools.py").read_text() == original
+    result = run(server.validate_yaml("name: a\n"))
+    assert "✓ 'a' is valid" in result
+    assert "mode:         interactive" in result
+    assert "model:        test:whatever" in result
 
 
-def test_edit_tool_no_match_within_span(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    original = "from miragen import register\n\n@register\nasync def solo(ctx):\n    return 1\n"
-    (d / "tools.py").write_text(original)
-
-    result = server.edit_tool("a", "solo", "nope", "x")
-
-    assert result.startswith("ERROR:")
-    assert (d / "tools.py").read_text() == original
-
-
-def test_edit_tool_ambiguous_within_span(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    original = (
-        "from miragen import register\n\n"
-        "@register\nasync def dup(ctx):\n    x = 1\n    x = 1\n    return x\n"
+def test_validate_yaml_reports_daemon_errors(daemon):
+    daemon.route(
+        "POST", "/validate", 422,
+        {"detail": "Invalid profile — 2 error(s):", "code": "validation_failed"},
     )
-    (d / "tools.py").write_text(original)
-
-    result = server.edit_tool("a", "dup", "x = 1", "x = 2")
-
-    assert result.startswith("ERROR:")
-    assert "2 times" in result
-    assert (d / "tools.py").read_text() == original
+    result = run(server.validate_yaml("nope"))
+    assert result.startswith("ERROR: Invalid profile")
 
 
-def test_edit_tool_happy_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text(
-        "from miragen import register\n\n"
-        "@register\nasync def alpha(ctx):\n    return 'alpha-marker'\n\n"
-        "@register\nasync def beta(ctx):\n    return 'beta-marker'\n"
+# ── check_deployment (agent health + daemon version) ─────────────────────────
+
+
+def _agent_transport_returning(monkeypatch, payload: dict):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/health"
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(server, "_agent_transport", httpx.MockTransport(handler))
+
+
+def test_check_deployment_compatible(daemon, monkeypatch):
+    _agent_transport_returning(
+        monkeypatch,
+        {
+            "version": "0.1.8",
+            "capabilities": sorted(server.SUPPORTED_CONTRACT_CAPABILITIES),
+        },
     )
-
-    result = server.edit_tool("a", "beta", "beta-marker", "beta-updated")
-
-    assert result.startswith("Tool 'beta' edited")
-    assert "restarted" in result
-    src = (d / "tools.py").read_text()
-    assert "beta-updated" in src
-    assert "beta-marker" not in src
-    assert "alpha-marker" in src  # other function untouched
+    daemon.route("GET", "/health", 200, {"status": "ok", "version": "0.1.9"})
+    result = run(server.check_deployment("a"))
+    assert result["compatible"] is True
+    assert result["daemon_miragen_version"] == "0.1.9"
+    assert result["missing"] == []
 
 
-def test_edit_tool_restart_failure_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "restart_agent", lambda name: "ERROR: container not found")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text(
-        "from miragen import register\n\n@register\nasync def solo(ctx):\n    return 1\n"
+def test_check_deployment_daemon_down_still_reports_agent(daemon, monkeypatch):
+    _agent_transport_returning(monkeypatch, {"version": "0.1.8", "capabilities": []})
+    daemon.raise_connect_error = True
+    result = run(server.check_deployment("a"))
+    assert result["daemon_miragen_version"] is None
+    assert result["compatible"] is False
+
+
+# ── resources ─────────────────────────────────────────────────────────────────
+
+
+def test_agents_resource_matches_list_agents(daemon):
+    daemon.route("GET", "/agents", 200, {"count": 1, "agents": [{"name": "a"}]})
+    assert run(server.agents_resource()) == {"count": 1, "agents": [{"name": "a"}]}
+
+
+def test_agent_yaml_resource_returns_content(daemon):
+    daemon.route(
+        "GET", "/agents/a/files", 200, {"path": "agent.yaml", "content": "name: a\n"}
     )
-
-    result = server.edit_tool("a", "solo", "return 1", "return 2")
-
-    assert result.startswith("Tool edited but restart failed")
-    assert "return 2" in (d / "tools.py").read_text()
+    assert run(server.agent_yaml_resource("a")) == "name: a\n"
+    assert daemon.last().url.params["path"] == "agent.yaml"
 
 
-# ── write_agent_file / edit_agent_file agent.yaml note ────────────────────────
-
-def test_write_agent_file_agent_yaml_adds_note(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    result = server.write_agent_file("a", "agent.yaml", "name: a\n")
-    assert "miragen_update_agent_config" in result
+def test_agent_tools_resource_returns_content(daemon):
+    daemon.route(
+        "GET", "/agents/a/files", 200, {"path": "tools.py", "content": "# tools\n"}
+    )
+    assert run(server.agent_tools_resource("a")) == "# tools\n"
+    assert daemon.last().url.params["path"] == "tools.py"
 
 
-def test_write_agent_file_other_path_no_note(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    result = server.write_agent_file("a", "notes.txt", "hi")
-    assert "miragen_update_agent_config" not in result
-
-
-def test_edit_agent_file_agent_yaml_adds_note(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "agent.yaml").write_text("name: a\nmode: autonomous\n")
-    result = server.edit_agent_file("a", "agent.yaml", "autonomous", "reactive")
-    assert "miragen_update_agent_config" in result
-
-
-# ── update_agent_config ───────────────────────────────────────────────────────
-
-def _fake_run(returncode, output=""):
-    def run(*a, **kw):
-        return type("Result", (), {"returncode": returncode, "stdout": output, "stderr": ""})()
-    return run
-
-
-def test_update_agent_config_agent_not_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    result = server.update_agent_config("missing", "name: missing\n")
-    assert result.startswith("ERROR:")
-    assert "miragen_list_agents" in result
-    assert "miragen_create_agent" in result
-
-
-def test_update_agent_config_invalid_yaml_untouched(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server.subprocess, "run", _fake_run(1, "schema error: bad field"))
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
-    (d / "agent.yaml").write_text(orig_yaml)
-
-    result = server.update_agent_config("a", "name: a\nmode: broken-mode\n")
-
-    assert result.startswith("ERROR: validation failed:")
-    assert "untouched" in result
-    assert (d / "agent.yaml").read_text() == orig_yaml
-    assert not (d / "agent.yaml.candidate").exists()
-
-
-def test_update_agent_config_name_mismatch(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
-    (d / "agent.yaml").write_text(orig_yaml)
-
-    result = server.update_agent_config("a", "name: b\nmode: autonomous\n")
-
-    assert result.startswith("ERROR:")
-    assert "'a'" in result
-    assert (d / "agent.yaml").read_text() == orig_yaml
-    assert not (d / "agent.yaml.candidate").exists()
-
-
-def test_update_agent_config_restart_failure_restores(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
-    monkeypatch.setattr(server, "restart_agent", lambda name: "ERROR: container not found")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    orig_yaml = "name: a\nmode: autonomous\ntools: []\n"
-    (d / "agent.yaml").write_text(orig_yaml)
-
-    result = server.update_agent_config("a", "name: a\nmode: reactive\ntools: []\n")
-
-    assert result.startswith("ERROR:")
-    assert "restart failed" in result
-    assert "previous config restored" in result
-    assert (d / "agent.yaml").read_text() == orig_yaml
-    assert not (d / "agent.yaml.candidate").exists()
-
-
-def test_update_agent_config_non_dict_live_yaml_diffs_cleanly(tmp_path, monkeypatch):
-    """A malformed live agent.yaml (valid YAML, not a mapping -- e.g. left behind by the
-    raw file-write tools this update flow exists to recover from) must not crash the diff
-    calculation after the candidate has already replaced it and the agent restarted."""
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
-    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "agent.yaml").write_text("- not\n- a\n- mapping\n")
-
-    result = server.update_agent_config("a", "name: a\nmode: autonomous\ntools: []\n")
-
-    assert result.startswith("Config updated and a restarted.")
-    assert (d / "agent.yaml").read_text() == "name: a\nmode: autonomous\ntools: []\n"
-
-
-def test_update_agent_config_success_diff_summary(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server.subprocess, "run", _fake_run(0))
-    monkeypatch.setattr(server, "restart_agent", lambda name: f"Agent {name} restarted.")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "agent.yaml").write_text("name: a\nmode: autonomous\ntools: []\n")
-
-    result = server.update_agent_config("a", "name: a\nmode: reactive\ntools: []\nextra: 1\n")
-
-    assert result.startswith("Config updated and a restarted.")
-    assert "mode" in result
-    assert "extra" in result
-    assert "tools" not in result.split("Diff summary:")[1]
-    assert (d / "agent.yaml").read_text() == "name: a\nmode: reactive\ntools: []\nextra: 1\n"
-    assert not (d / "agent.yaml.candidate").exists()
-
-
-# ── resources: miragen://agents ───────────────────────────────────────────────
-
-def test_agents_resource_matches_list_agents(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "agent.yaml").write_text("name: a\nmode: autonomous\nspec:\n  model: anthropic/claude\n")
-    assert server.agents_resource() == server.list_agents()
-
-
-# ── resources: miragen://agents/{name}/agent.yaml ─────────────────────────────
-
-def test_agent_yaml_resource_matches_file_content(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "agent.yaml").write_text("name: a\nmode: autonomous\n")
-    assert server.agent_yaml_resource("a") == server.read_agent_file("a", "agent.yaml")
-    assert server.agent_yaml_resource("a") == server.get_agent("a")["yaml"]
-
-
-def test_agent_yaml_resource_invalid_name_raises():
+def test_resources_raise_on_error(daemon):
+    daemon.route(
+        "GET", "/agents/a/files", 404,
+        {"detail": "file not found: agent.yaml", "code": "file_not_found"},
+    )
     with pytest.raises(ValueError):
-        server.agent_yaml_resource("../escape")
-
-
-def test_agent_yaml_resource_missing_agent_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
+        run(server.agent_yaml_resource("a"))
     with pytest.raises(ValueError):
-        server.agent_yaml_resource("ghost")
+        run(server.agent_yaml_resource("NOT-VALID"))
 
 
-def test_agent_yaml_resource_missing_file_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents" / "a").mkdir(parents=True)
-    with pytest.raises(FileNotFoundError):
-        server.agent_yaml_resource("a")
+# ── truncation helper ─────────────────────────────────────────────────────────
 
 
-# ── resources: miragen://agents/{name}/tools.py ───────────────────────────────
-
-def test_agent_tools_resource_matches_file_content(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    d = tmp_path / "agents" / "a"
-    d.mkdir(parents=True)
-    (d / "tools.py").write_text("from miragen import register\n\n# Tools for a\n")
-    assert server.agent_tools_resource("a") == server.read_agent_file("a", "tools.py")
+def test_truncate_short_passthrough():
+    assert server._truncate("short") == "short"
 
 
-def test_agent_tools_resource_invalid_name_raises():
-    with pytest.raises(ValueError):
-        server.agent_tools_resource("Bad Name")
+def test_truncate_long_output():
+    out = server._truncate("z" * 60_000)
+    assert len(out) < 60_000
+    assert "TRUNCATED" in out
 
 
-def test_agent_tools_resource_missing_agent_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    with pytest.raises(ValueError):
-        server.agent_tools_resource("ghost")
+# ── prompts (unchanged surface) ──────────────────────────────────────────────
 
 
-def test_agent_tools_resource_missing_file_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents" / "a").mkdir(parents=True)
-    with pytest.raises(FileNotFoundError):
-        server.agent_tools_resource("a")
+def test_create_agent_prompt_default_mode():
+    text = server.create_agent_prompt("watch the news")
+    assert "Purpose: watch the news" in text
+    assert "Mode: autonomous" in text
 
 
-# ── resource: miragen://docs/readme ───────────────────────────────────────────
+def test_create_agent_prompt_references_real_tools():
+    text = server.create_agent_prompt("x", mode="interactive")
+    for tool in (
+        "miragen_validate_yaml",
+        "miragen_create_agent",
+        "miragen_get_agent_logs",
+        "miragen_register_tool",
+    ):
+        assert tool in text
 
-def test_readme_resource_returns_fetched_content(monkeypatch):
+
+def test_readme_resource_falls_back_when_fetch_fails(monkeypatch):
     monkeypatch.setattr(server, "_readme_cache", None)
-    monkeypatch.setattr(server, "get_miragen_readme", lambda: "# Miragen\nfetched content")
-    assert server.readme_resource() == "# Miragen\nfetched content"
+    monkeypatch.setattr(
+        server, "get_miragen_readme", lambda: "ERROR: could not fetch README"
+    )
+    assert "offline schema summary" in server.readme_resource()
 
 
 def test_readme_resource_caches_after_success(monkeypatch):
     monkeypatch.setattr(server, "_readme_cache", None)
     calls = {"n": 0}
 
-    def fake_fetch():
+    def fetch():
         calls["n"] += 1
-        return f"content #{calls['n']}"
+        return "# miragen docs"
 
-    monkeypatch.setattr(server, "get_miragen_readme", fake_fetch)
-    first = server.readme_resource()
-    second = server.readme_resource()
-    assert first == second == "content #1"
+    monkeypatch.setattr(server, "get_miragen_readme", fetch)
+    assert server.readme_resource() == "# miragen docs"
+    assert server.readme_resource() == "# miragen docs"
     assert calls["n"] == 1
-
-
-def test_readme_resource_falls_back_when_fetch_fails(monkeypatch):
-    monkeypatch.setattr(server, "_readme_cache", None)
-    monkeypatch.setattr(server, "get_miragen_readme", lambda: "ERROR: could not fetch README: timeout")
-    result = server.readme_resource()
-    assert result == server._README_FALLBACK
-    assert "agent.yaml" in result
-
-
-def test_readme_resource_retries_after_failure(monkeypatch):
-    monkeypatch.setattr(server, "_readme_cache", None)
-    calls = {"n": 0}
-
-    def flaky_fetch():
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return "ERROR: no network"
-        return "fetched on retry"
-
-    monkeypatch.setattr(server, "get_miragen_readme", flaky_fetch)
-    assert server.readme_resource() == server._README_FALLBACK
-    assert server.readme_resource() == "fetched on retry"
-
-
-# ── prompt: create-agent ──────────────────────────────────────────────────────
-
-def test_create_agent_prompt_default_mode():
-    result = server.create_agent_prompt("send a daily weather summary")
-    assert "send a daily weather summary" in result
-    assert "autonomous" in result
-
-
-def test_create_agent_prompt_explicit_mode():
-    result = server.create_agent_prompt("watch a webhook", mode="reactive")
-    assert "watch a webhook" in result
-    assert "reactive" in result
-
-
-def test_create_agent_prompt_references_real_tools():
-    result = server.create_agent_prompt("do something")
-    for tool_name in (
-        "miragen_get_readme",
-        "miragen_validate_yaml",
-        "miragen_create_agent",
-        "miragen_get_agent_logs",
-        "miragen_register_tool",
-    ):
-        assert tool_name in result
-
-
-# ── real fastmcp end-to-end sanity (skipped if fastmcp isn't installed) ──────
-
-def test_resource_and_prompt_decorators_accept_real_fastmcp_kwargs():
-    """server.py calls mcp.resource(...)/mcp.prompt(...) with specific kwargs (mime_type,
-    name, description, uri templates with {param}). conftest fakes these as passthroughs
-    for unit testing, so this checks the real library actually accepts that call shape.
-
-    conftest.py unconditionally installs MagicMocks at sys.modules["fastmcp"] and
-    sys.modules["starlette*"] (server.py must import successfully even where the real
-    packages aren't installed), so a plain `pytest.importorskip("fastmcp")` would just find
-    the stub and never exercise the real library. Check the real distribution via
-    importlib.metadata instead, and swap the stubs out of sys.modules -- fastmcp pulls in
-    starlette transitively -- for the duration of this one test.
-    """
-    import importlib
-    import importlib.metadata
-    import sys
-
-    try:
-        importlib.metadata.version("fastmcp")
-    except importlib.metadata.PackageNotFoundError:
-        pytest.skip("real fastmcp package is not installed (only the conftest stub is present)")
-
-    def _is_stubbed_dep(n: str) -> bool:
-        return n == "fastmcp" or n.startswith(("fastmcp.", "starlette", "mcp", "uvicorn"))
-
-    saved = {n: sys.modules.pop(n) for n in list(sys.modules) if _is_stubbed_dep(n)}
-    try:
-        real_fastmcp = importlib.import_module("fastmcp")
-        real_mcp = real_fastmcp.FastMCP("test-server")
-
-        template = real_mcp.resource(
-            "miragen://agents/{name}/agent.yaml",
-            name="Agent Profile",
-            description="Raw agent.yaml contents for one agent.",
-            mime_type="text/yaml",
-        )(lambda name: f"name: {name}\n")
-        assert template.name == "Agent Profile"
-
-        prompt = real_mcp.prompt(name="create-agent")(
-            lambda purpose, mode="autonomous": f"{purpose} {mode}"
-        )
-        assert prompt.name == "create-agent"
-    finally:
-        for n in [n for n in sys.modules if _is_stubbed_dep(n)]:
-            del sys.modules[n]
-        sys.modules.update(saved)
-
-
-# ── _compose_add_service: internal-token propagation ─────────────────────────
-
-def test_compose_service_forwards_internal_token(tmp_path, monkeypatch):
-    """A managed agent must receive MIRAGEN_INTERNAL_TOKEN so its own /run*
-    guard is enabled with the same shared token this server authenticates with —
-    otherwise it boots unprotected while we send the header."""
-    monkeypatch.setattr(server, "COMPOSE_FILE", tmp_path / "compose.yml")
-    monkeypatch.setattr(server, "MIRAGEN_INTERNAL_TOKEN", "sekrit")
-
-    server._compose_add_service("worker")
-
-    env = server._read_yaml(tmp_path / "compose.yml")["services"]["worker"]["environment"]
-    assert env["MIRAGEN_INTERNAL_TOKEN"] == "sekrit"
-    assert env["AGENT_PROFILE"] == "agent.yaml"
-
-
-def test_compose_service_omits_token_when_unset(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "COMPOSE_FILE", tmp_path / "compose.yml")
-    monkeypatch.setattr(server, "MIRAGEN_INTERNAL_TOKEN", "")
-
-    server._compose_add_service("worker")
-
-    env = server._read_yaml(tmp_path / "compose.yml")["services"]["worker"]["environment"]
-    assert "MIRAGEN_INTERNAL_TOKEN" not in env
-
-
-# ── export / import agent (issue #6) ──────────────────────────────────────────
-
-import io
-import tarfile
-
-
-def _make_agent(agents_dir, name, *, with_extras=True):
-    d = agents_dir / name
-    d.mkdir(parents=True)
-    (d / "agent.yaml").write_text(f"name: {name}\nmode: autonomous\ntools: []\n")
-    (d / "tools.py").write_text("from miragen import register\n")
-    if with_extras:
-        (d / "runs").mkdir()
-        (d / "runs" / "run1.json").write_text('{"id": 1}')
-        (d / "history.json").write_text("[]")
-        pyc = d / "__pycache__"
-        pyc.mkdir()
-        (pyc / "x.pyc").write_text("junk")
-        data = d / "data"
-        data.mkdir()
-        (data / "notes.md").write_text("# notes")
-    return d
-
-
-def _archive_members(path):
-    with tarfile.open(path, "r:gz") as tar:
-        return sorted(m.name for m in tar.getmembers())
-
-
-def test_export_agent_excludes_runs_history_pycache(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    _make_agent(tmp_path / "agents", "worker")
-
-    result = server.export_agent("worker")
-    assert "error" not in result, result
-    assert result["agent"] == "worker"
-    assert result["included"] == ["agent.yaml", "data/notes.md", "tools.py"]
-
-    members = _archive_members(result["archive_path"])
-    assert "worker/agent.yaml" in members
-    assert "worker/data/notes.md" in members
-    assert not any("runs/" in m for m in members)
-    assert not any("history.json" in m for m in members)
-    assert not any("__pycache__" in m for m in members)
-
-
-def test_export_agent_skips_large_files(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "MAX_EXPORT_FILE_BYTES", 16)
-    d = _make_agent(tmp_path / "agents", "worker", with_extras=False)
-    (d / "big.bin").write_bytes(b"x" * 64)
-
-    result = server.export_agent("worker")
-    assert "big.bin" not in result["included"]
-    assert any(s["path"] == "big.bin" and "10 MB" in s["reason"] for s in result["skipped"])
-
-
-def test_export_agent_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents").mkdir()
-    result = server.export_agent("ghost")
-    assert result["error"].startswith("ERROR: agent 'ghost' not found")
-
-
-def test_export_agent_invalid_name(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    result = server.export_agent("Bad Name!")
-    assert result["error"].startswith("ERROR: invalid agent name")
-
-
-def test_export_agent_refuses_oversized_archive(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "MAX_ARCHIVE_BYTES", 1)  # anything real exceeds 1 byte
-    _make_agent(tmp_path / "agents", "worker", with_extras=False)
-    result = server.export_agent("worker")
-    assert result["error"].startswith("ERROR: export archive would be")
-    # the oversized archive is cleaned up
-    assert list((tmp_path / "exports").glob("*.tar.gz")) == []
-
-
-def _ok_proc(*a, **k):
-    from unittest.mock import MagicMock
-
-    return MagicMock(returncode=0, stdout="", stderr="")
-
-
-def test_import_round_trips_agent(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
-    monkeypatch.setattr(server.subprocess, "run", _ok_proc)
-    _make_agent(tmp_path / "agents", "worker")
-
-    export = server.export_agent("worker")
-    # simulate deletion of the source workspace, then import under a new name
-    import shutil as _shutil
-
-    _shutil.rmtree(tmp_path / "agents" / "worker")
-
-    result = server.import_agent("worker-copy", export["archive_path"])
-    assert result.startswith("Agent worker-copy imported"), result
-
-    d = tmp_path / "agents" / "worker-copy"
-    assert (d / "tools.py").read_text() == "from miragen import register\n"
-    yaml_text = (d / "agent.yaml").read_text()
-    assert "name: worker-copy" in yaml_text
-    assert "name: worker\n" not in yaml_text
-    # runs/history/pycache were never in the archive
-    assert not (d / "runs").exists()
-    assert not (d / "history.json").exists()
-
-
-def test_import_accepts_relative_exports_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
-    monkeypatch.setattr(server.subprocess, "run", _ok_proc)
-    _make_agent(tmp_path / "agents", "worker", with_extras=False)
-    export = server.export_agent("worker")
-    fname = pytest.importorskip("pathlib").Path(export["archive_path"]).name
-
-    result = server.import_agent("copy", f"exports/{fname}", start=False)
-    assert result.startswith("Agent copy imported")
-    assert "not started" in result
-
-
-def test_import_rejects_existing_agent(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    _make_agent(tmp_path / "agents", "worker", with_extras=False)
-    result = server.import_agent("worker", "exports/whatever.tar.gz")
-    assert result.startswith("ERROR: agent 'worker' already exists")
-
-
-def test_import_rejects_path_outside_exports(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents").mkdir()
-    for bad in ["/etc/passwd", "../secrets.tar.gz", "exports/../evil.tar.gz"]:
-        result = server.import_agent("copy", bad)
-        assert result.startswith("ERROR")
-
-
-def test_import_missing_archive(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents").mkdir()
-    result = server.import_agent("copy", "exports/nope.tar.gz")
-    assert result.startswith("ERROR: archive not found")
-
-
-def _write_tar(path, members):
-    """members: list of (name, bytes|None). None => craft a raw TarInfo (for
-    malicious names tarfile.add would sanitize)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(path, "w:gz") as tar:
-        for name, content in members:
-            info = tarfile.TarInfo(name=name)
-            info.size = len(content)
-            tar.addfile(info, io.BytesIO(content))
-
-
-def test_import_rejects_traversal_archive(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents").mkdir()
-    archive = tmp_path / "exports" / "evil.tar.gz"
-    _write_tar(archive, [
-        ("copy/agent.yaml", b"name: copy\n"),
-        ("../evil.txt", b"pwned"),
-    ])
-    result = server.import_agent("copy", "exports/evil.tar.gz")
-    assert result.startswith("ERROR: could not safely extract")
-    assert not (tmp_path / "agents" / "copy").exists()
-    # no stray traversal file landed next to exports/
-    assert not (tmp_path / "evil.txt").exists()
-
-
-def test_import_neutralizes_absolute_path_archive(tmp_path, monkeypatch):
-    # tarfile's "data" filter strips leading slashes rather than raising, so an
-    # absolute member is neutralized to a path *inside* the staging dir and never
-    # escapes. Here it lands as staging/opt/evil.txt (no agent.yaml at root), so the
-    # import is still rejected and nothing is written to the real /opt/evil.txt.
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    (tmp_path / "agents").mkdir()
-    escape_target = tmp_path / "opt" / "evil.txt"
-    archive = tmp_path / "exports" / "abs.tar.gz"
-    _write_tar(archive, [(str(escape_target), b"pwned")])
-    result = server.import_agent("copy", "exports/abs.tar.gz")
-    assert result.startswith("ERROR")
-    assert not (tmp_path / "agents" / "copy").exists()
-    assert not escape_target.exists()  # the absolute path did not escape staging
-
-
-def test_import_rolls_back_on_validation_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    add_called = []
-    monkeypatch.setattr(server, "_compose_add_service", lambda name: add_called.append(name))
-    monkeypatch.setattr(
-        server.subprocess, "run",
-        lambda *a, **k: __import__("unittest").mock.MagicMock(returncode=1, stdout="bad schema", stderr=""),
-    )
-    _make_agent(tmp_path / "agents", "worker", with_extras=False)
-    export = server.export_agent("worker")
-
-    result = server.import_agent("copy", export["archive_path"])
-    assert result.startswith("ERROR: imported profile failed validation")
-    assert not (tmp_path / "agents" / "copy").exists()
-    assert add_called == []  # never registered in compose
-
-
-def test_import_rolls_back_on_start_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "AGENTS_DIR", tmp_path / "agents")
-    removed = []
-    monkeypatch.setattr(server, "_compose_add_service", lambda name: None)
-    monkeypatch.setattr(server, "_compose_remove_service", lambda name: removed.append(name))
-
-    calls = {"n": 0}
-
-    def run(*a, **k):
-        from unittest.mock import MagicMock
-
-        calls["n"] += 1
-        if calls["n"] == 1:  # validate
-            return MagicMock(returncode=0, stdout="", stderr="")
-        return MagicMock(returncode=1, stdout="", stderr="boom")  # docker compose up
-
-    monkeypatch.setattr(server.subprocess, "run", run)
-    _make_agent(tmp_path / "agents", "worker", with_extras=False)
-    export = server.export_agent("worker")
-
-    result = server.import_agent("copy", export["archive_path"])
-    assert result.startswith("ERROR: agent imported but container failed to start")
-    assert not (tmp_path / "agents" / "copy").exists()
-    assert removed == ["copy"]
