@@ -52,45 +52,16 @@ SYSTEM_PROMPT = (
 )
 
 
-def _install_stubs(workspace: Path) -> None:
-    """Stub the server's side-effecting deps so it imports without a docker
-    socket / OAuth / scheduler, but keep fastmcp real. Mirrors tests/conftest.py."""
+def _install_stubs() -> None:
+    """Stub the server's side-effecting deps so it imports cleanly, keeping
+    fastmcp real. Mirrors tests/conftest.py.
+
+    Post lifecycle-extraction there is no docker socket or scheduler to stub —
+    the server's only heavy dependency left is origo (OAuth), skipped at
+    runtime by MCP_NO_AUTH=true; an import-only stub suffices. The fixture
+    workspace itself is served by a fake miragend transport installed on
+    server._daemon_transport AFTER the import (see _run)."""
     os.environ.setdefault("MCP_NO_AUTH", "true")
-    os.environ["MIRAGEN_WORKSPACE"] = str(workspace)
-
-    # NB: fastmcp, starlette and uvicorn are the *real* packages here — the model
-    # must talk to the genuine FastMCP server — so only the side-effecting deps
-    # (docker socket, scheduler, OAuth provider) are stubbed. MCP_NO_AUTH=true
-    # skips the origo runtime path, so an import-only stub is enough for it.
-
-    class _NotFound(Exception):
-        pass
-
-    docker_errors = MagicMock()
-    docker_errors.NotFound = _NotFound
-    docker_mod = MagicMock()
-    docker_mod.from_env.return_value = MagicMock()
-    docker_mod.errors = docker_errors
-    sys.modules["docker"] = docker_mod
-    sys.modules["docker.errors"] = docker_errors
-
-    for mod in (
-        "apscheduler",
-        "apscheduler.schedulers",
-        "apscheduler.schedulers.asyncio",
-        "apscheduler.triggers",
-        "apscheduler.triggers.date",
-        "apscheduler.jobstores",
-        "apscheduler.jobstores.sqlalchemy",
-    ):
-        sys.modules[mod] = MagicMock()
-
-    class _JobLookupError(Exception):
-        pass
-
-    jobstores_base = MagicMock()
-    jobstores_base.JobLookupError = _JobLookupError
-    sys.modules["apscheduler.jobstores.base"] = jobstores_base
 
     origo_provider = MagicMock(storage=MagicMock(), public_registration=False, auto_approve=False)
     oauth_app = MagicMock()
@@ -172,9 +143,16 @@ async def _answer_question(anthropic_client, model, mcp_client, anthropic_tools,
 async def _run(selected_id: str | None) -> int:
     import check_evals  # local; also puts EVALS_DIR on sys.path via its import
 
-    _install_stubs(EVALS_DIR / "fixtures")
+    _install_stubs()
     sys.path.insert(0, str(REPO_ROOT))
     import server  # noqa: E402  (imported after stubs are installed)
+
+    # The read-only tools are HTTP delegates to miragend; serve the fixture
+    # workspace through the same fake daemon the pytest suite uses.
+    import httpx
+    from fixture_daemon import fixture_daemon
+
+    server._daemon_transport = httpx.MockTransport(fixture_daemon)
 
     import anthropic
     from fastmcp import Client

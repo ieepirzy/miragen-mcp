@@ -1,5 +1,5 @@
 # Thin MCP adapter over the miragend lifecycle daemon + direct agent HTTP.
-# docker/miragen/apscheduler/sqlalchemy/pyyaml left with the extraction of the
+# docker/miragen/apscheduler/sqlalchemy left with the extraction of the
 # lifecycle core into miragend (miragen repo) — this container holds no Docker
 # socket, no workspace volume, and no persistent state.
 fastmcp>=2.0
@@ -7,3 +7,8 @@ origo>=0.1.9
 starlette>=0.40
 httpx>=0.27
 uvicorn[standard]>=0.30
+# server.py itself no longer parses YAML, but the eval/test tooling that ships
+# in this repo does (evals/ground_truth.py, evals/fixture_daemon.py,
+# tests/test_evals.py) — keep it so `pip install -r requirements.txt` still
+# supports the documented local test/eval workflow.
+pyyaml>=6.0
