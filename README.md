@@ -113,8 +113,11 @@ missing), matching FastMCP's convention for resources.
 
 ## Requirements
 
-- A running miragend daemon (`ghcr.io/ieepirzy/miragend` — included as a
-  service in this repo's `compose.yml`)
+- A running miragend daemon (`ghcr.io/ieepirzy/miragend`), reachable at
+  `MIRAGEND_URL` and attached to the `miragen-net` network **before** this
+  stack deploys — provision it separately (see "Docker (single containers,
+  no ingress split)" below for a standalone `docker run`); this repo's
+  `compose.yml` only starts the MCP adapter, not the daemon
 - Python 3.12 (or use the provided Docker image)
 
 No Docker socket access and no Compose plugin are needed by this container —
@@ -129,8 +132,14 @@ Two environments run this service and need **opposite** ingress shapes. One
 second file, because Portainer locks a git-stack's Compose path at creation and
 gives no way to layer a second file onto a stack that already exists:
 
-The stack now has two services: `miragend` (profile-independent — both shapes
-need it) and the MCP adapter (profile-gated ingress).
+This `compose.yml` has one deployable service (profile-gated ingress) — the
+MCP adapter only. **`miragend` is not part of this project**: it holds the
+raw Docker socket, so it is provisioned and owned separately (a standalone
+`docker run`, per "Docker (single containers, no ingress split)" below, or
+its own compose project) and must already be up and attached to
+`miragen-net` before this stack deploys. `miragen-net` is declared
+`external: true` here precisely because this project must never try to
+create or own it — only attach to what miragend already created.
 
 ```bash
 # VPS: NPM runs on the same host, reached by container-name DNS over a shared
@@ -146,8 +155,9 @@ In Portainer, set `COMPOSE_PROFILES` (`vps` or `homelab`) as a stack environment
 variable — that's editable at any time, unlike the Compose path. `DOCKER_GID`
 is gone: miragend detects the docker socket's group at runtime, so nothing
 host-specific needs to be configured for socket access anymore. Set
-`MIRAGEND_TOKEN` (shared by both services) so the lifecycle API is not relying
-on network isolation alone.
+`MIRAGEND_TOKEN` to the same value miragend itself was started with — this
+project only consumes it, it does not mint or share it — so the lifecycle
+API is not relying on network isolation alone.
 
 > **Do not make `BOUND_IP` a required var (`:?`) in compose.yml.** Compose
 > interpolates every service block in the file up front regardless of which
@@ -218,7 +228,7 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 | `MCP_NO_AUTH` | `false` | Disable OAuth entirely (local development only) |
 | `MCP_ALLOW_DEFAULT_SECRET` | `false` | Explicitly acknowledge and allow starting with the default `changeme` secret while auth is enabled (not recommended) |
 
-**The daemon (miragend service in `compose.yml`):**
+**The daemon (miragend — provisioned separately, not a service in this repo's `compose.yml`):**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -241,7 +251,7 @@ into created agents' compose entries; the MCP adapter never sees a model key):
 | `GROQ_API_KEY` | |
 | `COHERE_API_KEY` | |
 
-Append `_FILE` to any key variable to read from a Docker secret instead (e.g. `ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key`) — see `compose.secrets.yml`.
+Append `_FILE` to any key variable to read from a Docker secret instead (e.g. `ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key`) — set up on whatever provisions miragend itself, not in this repo (its `compose.secrets.yml` layered secrets onto a bundled `miragend` service that no longer exists here; removed).
 
 ## Workspace Layout
 

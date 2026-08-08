@@ -1,7 +1,8 @@
 # ── miragen-mcp: thin OAuth-fronted MCP adapter for AI clients ───────────────
 # All API keys are passed as plain environment variables.
 # Set them in your shell, .env file, or Portainer stack environment vars UI.
-# For Docker secrets (docker compose direct deployment), use compose.secrets.yml.
+# (This adapter never sees a model key at all — those belong to miragend,
+# provisioned separately; see the README's Requirements section.)
 #
 # miragend — the swarm lifecycle daemon (miragen repo, image
 # ghcr.io/ieepirzy/miragend) — is deliberately NOT a service in this file. It
@@ -92,10 +93,20 @@ services:
       - miragen-net
 
 networks:
-  # Created by compose if absent, and by miragend at runtime
-  # (ensure_network) so spawned agents can always be attached to it.
+  # Owned by miragend, not this project: miragend creates it at runtime
+  # (ensure_network) if absent, the same way it does for spawned agents.
+  # Declaring it non-external here (as an earlier version of this file did,
+  # back when miragend was also a service in this same project) makes
+  # Compose try to create/own it itself — which a fresh host with no
+  # miragen-net yet tolerates, but a host where miragend already created it
+  # does not: Compose finds a pre-existing network without this project's
+  # labels and refuses to attach rather than reuse it (Codex review, PR #18).
+  # `external: true` is the correct declaration on both hosts: it says
+  # "attach to what's there," never "create or own it" — matching what
+  # mirarun's compose.yaml already declares for the same network.
   miragen-net:
     name: miragen-net
+    external: true
   # Owned by NPM's own stack; only referenced under the vps profile, so this
   # entry is never resolved (and never needs to exist) under the homelab
   # profile.
