@@ -62,6 +62,9 @@ x-miragen-mcp-base: &miragen-mcp-base
     MCP_BASE_URL: ${MCP_BASE_URL}
     MCP_CLIENT_ID: ${MCP_CLIENT_ID}
     MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
+    # Extra OAuth redirect URIs beyond the claude.ai/claude.com defaults,
+    # comma-separated. Leave empty for claude.ai.
+    MCP_CLIENT_REDIRECT_URIS: ${MCP_CLIENT_REDIRECT_URIS:-}
     MCP_AUTO_APPROVE: ${MCP_AUTO_APPROVE:-false}
     MCP_PUBLIC_REGISTRATION: ${MCP_PUBLIC_REGISTRATION:-false}
     MCP_NO_AUTH: ${MCP_NO_AUTH:-false}

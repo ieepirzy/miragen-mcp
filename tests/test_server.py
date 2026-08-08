@@ -66,6 +66,40 @@ def test_module_imports():
     assert server.MIRAGEND_URL.startswith("http")
 
 
+# ── OAuth redirect allowlist ─────────────────────────────────────────────────
+# origo fails closed (rejects every redirect_uri at /authorize) without an
+# explicit allowlist — these pin down that the default claude.ai/claude.com
+# callbacks are always present and operator extras merge rather than replace.
+
+
+def test_redirect_uris_default_to_claude_callbacks(monkeypatch):
+    monkeypatch.delenv("MCP_CLIENT_REDIRECT_URIS", raising=False)
+    uris = server._client_redirect_uris()
+    assert "https://claude.ai/api/mcp/auth_callback" in uris
+    assert "https://claude.com/api/mcp/auth_callback" in uris
+
+
+def test_redirect_uris_empty_env_falls_back_to_claude_defaults(monkeypatch):
+    # Compose always exports a declared variable, so an unset
+    # MCP_CLIENT_REDIRECT_URIS in Portainer reaches this process as "" — must
+    # not be read as "allowlist nothing".
+    monkeypatch.setenv("MCP_CLIENT_REDIRECT_URIS", "")
+    uris = server._client_redirect_uris()
+    assert "https://claude.ai/api/mcp/auth_callback" in uris
+    assert "https://claude.com/api/mcp/auth_callback" in uris
+
+
+def test_redirect_uris_extras_merge_with_defaults(monkeypatch):
+    monkeypatch.setenv(
+        "MCP_CLIENT_REDIRECT_URIS",
+        "https://other.example/cb, https://claude.ai/api/mcp/auth_callback",
+    )
+    uris = server._client_redirect_uris()
+    assert uris.count("https://claude.ai/api/mcp/auth_callback") == 1  # deduped
+    assert "https://other.example/cb" in uris
+    assert "https://claude.com/api/mcp/auth_callback" in uris  # defaults kept
+
+
 # ── request composition & auth ───────────────────────────────────────────────
 
 
