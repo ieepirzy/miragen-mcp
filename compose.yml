@@ -1,20 +1,23 @@
-# ── miragen management plane: miragend (lifecycle daemon) + miragen-mcp ──────
+# ── miragen-mcp: thin OAuth-fronted MCP adapter for AI clients ───────────────
 # All API keys are passed as plain environment variables.
 # Set them in your shell, .env file, or Portainer stack environment vars UI.
 # For Docker secrets (docker compose direct deployment), use compose.secrets.yml.
 #
-# Two services since the lifecycle extraction:
-#
-#   miragend     — the swarm lifecycle daemon (miragen repo). The ONE container
-#                  with the Docker socket and the /opt/miragen workspace. Agent
-#                  create/start/stop/delete, tool/file management, schedules,
-#                  and the swarm registry live here. API keys live here too:
-#                  the daemon writes them into created agents' compose entries.
-#   miragen-mcp  — thin OAuth-fronted MCP adapter for AI clients. No socket,
-#                  no workspace, no persistent state; delegates lifecycle to
-#                  miragend over HTTP and talks to agents directly for
-#                  run/approval traffic. mirarun connects to miragend the same
-#                  way this adapter does — they are sibling clients.
+# miragend — the swarm lifecycle daemon (miragen repo, image
+# ghcr.io/ieepirzy/miragend) — is deliberately NOT a service in this file. It
+# holds the raw Docker socket and the /opt/miragen workspace, so it is
+# provisioned and owned outside this git-tracked, Portainer-managed stack
+# (kept off the scoped Portainer credential's visibility on purpose — the
+# same "no Docker socket, ever" boundary miradeploy itself enforces). This
+# stack only needs miragend reachable at MIRAGEND_URL (default
+# http://miragend:8000, resolvable because both attach to the shared
+# miragen-net network) and MIRAGEND_TOKEN/MIRAGEN_INTERNAL_TOKEN matching
+# whatever miragend was actually started with. A prior version of this file
+# bundled a `miragend:` service block; deploying it here collided on the
+# container name "miragend" with the already-running externally-managed one
+# and failed the whole stack (2026-08-08) — don't reintroduce it. mirarun
+# connects to the same externally-managed miragend the same way this adapter
+# does — they are sibling clients, not each other's dependency.
 #
 # MCP ingress: ONE file, TWO ingress shapes, selected by COMPOSE_PROFILES.
 # This is deliberate: Portainer locks the git-stack "Compose path" at creation
@@ -40,9 +43,6 @@
 # by construction: only one service block is ever instantiated, so there is
 # no unconditional network declaration to get wrong.
 #
-# miragend carries no profile: both shapes need it, it publishes no port, and
-# it only ever joins miragen-net.
-#
 # Deploy:
 #   docker compose --profile vps     up -d --build
 #   docker compose --profile homelab up -d --build
@@ -54,8 +54,6 @@ x-miragen-mcp-base: &miragen-mcp-base
     context: .
   container_name: miragen-mcp
   restart: unless-stopped
-  depends_on:
-    - miragend
   environment:
     MIRAGEND_URL: http://miragend:8000
     MIRAGEND_TOKEN: ${MIRAGEND_TOKEN:-}
@@ -71,33 +69,6 @@ x-miragen-mcp-base: &miragen-mcp-base
     - no-new-privileges:true
 
 services:
-  miragend:
-    image: ${MIRAGEND_IMAGE:-ghcr.io/ieepirzy/miragend:latest}
-    container_name: miragend
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/miragen:/opt/miragen
-    environment:
-      MIRAGEN_WORKSPACE: /opt/miragen
-      MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
-      MIRAGEND_TOKEN: ${MIRAGEND_TOKEN:-}
-      MIRAGEN_INTERNAL_TOKEN: ${MIRAGEN_INTERNAL_TOKEN:-}
-      # Forwarded into every agent the daemon creates (as compose environment
-      # entries), exactly as miragen-mcp itself used to do.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      XAI_API_KEY: ${XAI_API_KEY:-}
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      COHERE_API_KEY: ${COHERE_API_KEY:-}
-    networks:
-      - miragen-net
-    security_opt:
-      - no-new-privileges:true
-
   miragen-mcp:
     <<: *miragen-mcp-base
     profiles: ["vps"]
