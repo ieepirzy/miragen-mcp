@@ -1,1 +1,32 @@
-tests/
+# The Dockerfile COPYs only requirements.txt and server.py. This file previously
+# listed `tests/` alone, so .git and evals/ were still uploaded to the daemon on
+# every build.
+
+.git
+.github
+.gitignore
+
+# Tests and evals are CI/developer inputs, never runtime inputs.
+tests
+evals
+
+# Compose files describe how to run the image; they don't belong inside it.
+compose.yml
+compose.secrets.yml
+.env
+.env.*
+!.env.example
+
+# Python build/test/cache artifacts.
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+
+# Editor/OS cruft.
+.vscode
+.idea
+.DS_Store
