@@ -225,6 +225,7 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 | `MCP_BASE_URL` | *(required)* | Public base URL of this server — used for OAuth |
 | `MCP_CLIENT_ID` | `miragen-mcp` | OAuth client ID |
 | `MCP_CLIENT_SECRET` | `changeme` | OAuth client secret — **must be set explicitly if auth is enabled** |
+| `MCP_CLIENT_REDIRECT_URIS` | claude.ai/claude.com callbacks | OAuth redirect allowlist for the pre-registered client — origo rejects every redirect_uri at `/authorize` (fail closed) without one, so this must be set correctly for any client to authorize at all |
 | `MCP_NO_AUTH` | `false` | Disable OAuth entirely (local development only) |
 | `MCP_ALLOW_DEFAULT_SECRET` | `false` | Explicitly acknowledge and allow starting with the default `changeme` secret while auth is enabled (not recommended) |
 

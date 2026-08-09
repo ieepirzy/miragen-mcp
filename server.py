@@ -1,3 +1,4 @@
+import inspect
 import logging
 import os
 import re
@@ -34,6 +35,33 @@ AUTO_APPROVE = os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true"
 PUBLIC_REGISTRATION = os.getenv("MCP_PUBLIC_REGISTRATION", "false").lower() == "true"
 NO_AUTH = os.getenv("MCP_NO_AUTH", "false").lower() == "true"
 MCP_PATH = os.getenv("MCP_PATH", "/mcp")
+
+# The claude.ai/claude.com connector callbacks are always allowlisted;
+# MCP_CLIENT_REDIRECT_URIS holds operator EXTRAS on top of them.
+_DEFAULT_REDIRECT_URIS = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+)
+
+
+def _client_redirect_uris() -> list:
+    """OAuth redirect allowlist: the Claude callbacks plus operator extras.
+
+    Merge, don't replace -- and read with `or`-fallback semantics: Compose
+    always exports a declared variable, so leaving MCP_CLIENT_REDIRECT_URIS
+    unset in Portainer reaches this process as an EMPTY STRING, which a plain
+    getenv-default would treat as "allowlist nothing" and break the primary
+    connector flow (same declared-but-empty passthrough shape this codebase
+    has hit before -- movingfirm-admin issue #57).
+    """
+    extras = [
+        uri.strip()
+        for uri in (os.getenv("MCP_CLIENT_REDIRECT_URIS") or "").split(",")
+        if uri.strip()
+    ]
+    return list(_DEFAULT_REDIRECT_URIS) + [
+        uri for uri in extras if uri not in _DEFAULT_REDIRECT_URIS
+    ]
 
 # The lifecycle daemon. Default resolves by container-name DNS on miragen-net.
 MIRAGEND_URL = os.getenv("MIRAGEND_URL", "http://miragend:8000").rstrip("/")
@@ -1744,7 +1772,7 @@ if not NO_AUTH:
             "possible."
         )
 
-    auth = OAuthProvider(
+    provider_kwargs = dict(
         base_url=BASE_URL,
         clients={CLIENT_ID: CLIENT_SECRET},
         token_ttl=604800,
@@ -1752,6 +1780,15 @@ if not NO_AUTH:
         public_registration=PUBLIC_REGISTRATION,
         mcp_path=MCP_PATH,
     )
+    # origo (this installed version, per the "fail closed" warning at startup
+    # otherwise) rejects every redirect_uri at /authorize unless the client is
+    # seeded with an explicit allowlist — there is no permissive default here,
+    # unlike older origo releases. Pass one when this origo supports the
+    # parameter, same fix already applied to miradeploy/mirarun's server.py
+    # for the same origo 0.1.10->0.1.11 behavior change.
+    if "client_redirect_uris" in inspect.signature(OAuthProvider.__init__).parameters:
+        provider_kwargs["client_redirect_uris"] = {CLIENT_ID: _client_redirect_uris()}
+    auth = OAuthProvider(**provider_kwargs)
 
     # Take origo's routes and state from the provider's own app rather than
     # re-declaring them here. origo's endpoints read eleven app.state attributes
