@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from typing import Annotated
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,12 @@ from pydantic import Field
 
 BASE_URL = os.getenv("MCP_BASE_URL")
 CLIENT_ID = os.getenv("MCP_CLIENT_ID", "miragen-mcp")
-CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "changeme")
+# `or`-fallback, not a getenv default: Compose always exports a declared
+# variable, so MCP_CLIENT_SECRET left unset in Portainer reaches this process
+# as an EMPTY STRING (issue #57's declared-but-empty shape). Folding "" into
+# "changeme" routes it into the fail-closed guard at the bottom of this file
+# instead of registering the client with an empty, trivially-known secret.
+CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET") or "changeme"
 AUTO_APPROVE = os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true"
 PUBLIC_REGISTRATION = os.getenv("MCP_PUBLIC_REGISTRATION", "false").lower() == "true"
 NO_AUTH = os.getenv("MCP_NO_AUTH", "false").lower() == "true"
@@ -127,6 +133,23 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
 # Test seam: when set (httpx.MockTransport in tests), daemon HTTP calls route
 # through it instead of the docker network.
 _daemon_transport = None
+
+
+def _path_segment(value: str) -> str:
+    """Encode one caller-supplied value as exactly one URL path segment.
+
+    Interpolated raw, tool_name="../../schedules/x" is dot-segment-normalized
+    by httpx into /schedules/x — any daemon route, including DELETEs. Agent
+    names and run ids are already pattern-validated; this covers the free-
+    string components (tool_name, job_id). quote(safe="") percent-encodes "/"
+    but leaves "." and ".." bare (dots are unreserved) and httpx still
+    normalizes those away, so the two dot segments are encoded by hand; the
+    daemon then sees a literal-dot name and 404s like any other unknown one.
+    """
+    quoted = quote(value, safe="")
+    if quoted in (".", ".."):
+        quoted = quoted.replace(".", "%2E")
+    return quoted
 
 # Follow-up guidance appended to daemon errors, keyed by the daemon's
 # machine-readable error code. The daemon speaks clean machine errors; the
@@ -728,7 +751,7 @@ async def get_tool_source(agent: AgentName, tool_name: ToolName) -> str:
     err = _check_agent_name(agent)
     if err:
         return err
-    body, err = await _daemon_request("GET", f"/agents/{agent}/tools/{tool_name}")
+    body, err = await _daemon_request("GET", f"/agents/{agent}/tools/{_path_segment(tool_name)}")
     if err:
         return err
     return body.get("source", "") if isinstance(body, dict) else str(body)
@@ -807,7 +830,7 @@ async def edit_tool(
         return err
     _, err = await _daemon_request(
         "PATCH",
-        f"/agents/{agent}/tools/{tool_name}",
+        f"/agents/{agent}/tools/{_path_segment(tool_name)}",
         json_body={"old_str": old_str, "new_str": new_str},
     )
     if err:
@@ -829,7 +852,7 @@ async def delete_tool(agent: AgentName, tool_name: ToolName) -> str:
     err = _check_agent_name(agent)
     if err:
         return err
-    _, err = await _daemon_request("DELETE", f"/agents/{agent}/tools/{tool_name}")
+    _, err = await _daemon_request("DELETE", f"/agents/{agent}/tools/{_path_segment(tool_name)}")
     if err:
         return err
     return f"Agent {agent} restarted."
@@ -1045,7 +1068,7 @@ async def cancel_retrigger(
     Use miragen_list_retriggers to find job ids. Returns "Retrigger <job_id> cancelled." or,
     if there is no such job, an actionable "ERROR: ..." naming miragen_list_retriggers.
     """
-    _, err = await _daemon_request("DELETE", f"/schedules/{job_id}")
+    _, err = await _daemon_request("DELETE", f"/schedules/{_path_segment(job_id)}")
     if err:
         return err
     return f"Retrigger '{job_id}' cancelled."

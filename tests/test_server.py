@@ -537,3 +537,60 @@ def test_readme_resource_caches_after_success(monkeypatch):
     assert server.readme_resource() == "# miragen docs"
     assert server.readme_resource() == "# miragen docs"
     assert calls["n"] == 1
+
+
+# ── caller-supplied path components stay inside their endpoint ────────────────
+
+
+def test_tool_name_cannot_escape_its_endpoint(daemon):
+    # tool_name is a free string (min_length=1, no pattern) interpolated into
+    # the request path; raw, "../../schedules/x" is dot-segment-normalized by
+    # httpx before sending and walks a nominal tools route onto any daemon
+    # route. Assert on raw_path — url.path is the percent-DECODED view and
+    # cannot distinguish an encoded segment from a traversal.
+    run(server.get_tool_source(agent="my-agent", tool_name="../../schedules/x"))
+    sent = bytes(daemon.last().url.raw_path).split(b"?")[0]
+    assert sent.startswith(b"/agents/my-agent/tools/"), sent
+    assert b"/schedules/" not in sent, sent
+
+
+def test_job_id_cannot_escape_its_endpoint(daemon):
+    # job_id feeds a DELETE — raw interpolation would turn a retrigger cancel
+    # into an arbitrary-route DELETE on the daemon.
+    run(server.cancel_retrigger(job_id="../agents/prod-agent"))
+    sent = bytes(daemon.last().url.raw_path).split(b"?")[0]
+    assert sent.startswith(b"/schedules/"), sent
+    assert b"/agents/" not in sent, sent
+
+
+def test_dot_segment_ids_do_not_collapse_the_path(daemon):
+    # "." and ".." are unreserved, so percent-quoting alone leaves them bare
+    # and httpx still normalizes them away; they must arrive encoded.
+    for evil in (".", ".."):
+        run(server.get_tool_source(agent="my-agent", tool_name=evil))
+        sent = bytes(daemon.last().url.raw_path).split(b"?")[0]
+        assert sent.startswith(b"/agents/my-agent/tools/"), (evil, sent)
+
+
+# ── OAuth client secret fails closed ─────────────────────────────────────────
+
+
+def test_empty_client_secret_fails_closed(monkeypatch):
+    # compose.yml declares MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}, and
+    # Compose exports a declared-but-unset variable as an EMPTY string (issue
+    # #57's declared-but-empty shape) — so "" must hit the same fail-closed
+    # guard as the well-known "changeme" default instead of registering the
+    # client with an empty secret.
+    import importlib
+
+    monkeypatch.setenv("MCP_CLIENT_SECRET", "")
+    monkeypatch.setenv("MCP_ALLOW_DEFAULT_SECRET", "false")
+    monkeypatch.delenv("MCP_NO_AUTH", raising=False)
+    try:
+        with pytest.raises(RuntimeError, match="MCP_CLIENT_SECRET"):
+            importlib.reload(server)
+    finally:
+        # Restore the conftest env (MCP_ALLOW_DEFAULT_SECRET=true) and
+        # re-execute the module so later tests see a fully-initialized state.
+        monkeypatch.undo()
+        importlib.reload(server)
