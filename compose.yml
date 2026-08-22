@@ -63,7 +63,7 @@ x-miragen-mcp-base: &miragen-mcp-base
   # creation, so an env var is the only thing about this stack you can change
   # after the fact. To build from a checkout instead, layer compose.ci.yml on
   # top (see that file).
-  image: ghcr.io/ieepirzy/miragen-mcp:${MIRAGEN_MCP_IMAGE_TAG:-latest}
+  image: ${MIRAGEN_MCP_IMAGE:-ghcr.io/ieepirzy/miragen-mcp:${MIRAGEN_MCP_IMAGE_TAG:-latest}}
   container_name: miragen-mcp
   restart: unless-stopped
   environment:
