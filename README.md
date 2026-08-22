@@ -141,15 +141,34 @@ its own compose project) and must already be up and attached to
 `external: true` here precisely because this project must never try to
 create or own it — only attach to what miragend already created.
 
+`compose.yml` pulls `ghcr.io/ieepirzy/miragen-mcp`, which
+`.github/workflows/publish.yml` builds on every push to `main` — the
+deployment host does not build it. Pin a specific build with
+`MIRAGEN_MCP_IMAGE_TAG` (`latest` by default, or `sha-<commit>`); like
+`COMPOSE_PROFILES` it is a stack environment variable, so it stays editable
+after the stack exists, unlike the Compose path.
+
 ```bash
 # VPS: NPM runs on the same host, reached by container-name DNS over a shared
 # `proxy` network (which NPM's own stack must already have created).
-COMPOSE_PROFILES=vps docker compose up -d --build
+COMPOSE_PROFILES=vps docker compose up -d
 
 # homelab (or anywhere the reverse proxy is on a different machine): published
 # on loopback plus BOUND_IP, which should be this host's WireGuard address.
-BOUND_IP=10.x.x.x COMPOSE_PROFILES=homelab docker compose up -d --build
+BOUND_IP=10.x.x.x COMPOSE_PROFILES=homelab docker compose up -d
 ```
+
+To build from a checkout instead of pulling — developing on the adapter
+itself — layer the build override on top:
+
+```bash
+COMPOSE_PROFILES=vps docker compose -f compose.yml -f compose.ci.yml up -d --build
+```
+
+If the pull fails with `denied`, the GHCR package is private: a package is
+created private and does not become public merely by belonging to a public
+repository. Either flip its visibility in the package settings, or give the
+host a `ghcr.io` credential (a classic PAT with `read:packages`).
 
 In Portainer, set `COMPOSE_PROFILES` (`vps` or `homelab`) as a stack environment
 variable — that's editable at any time, unlike the Compose path. `DOCKER_GID`
