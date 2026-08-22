@@ -1,0 +1,30 @@
+# Build override — layered on top of compose.yml, never deployed.
+#
+#   docker compose -f compose.yml -f compose.ci.yml --profile vps up -d --build
+#
+# compose.yml references the published GHCR image so the deployment host never
+# builds. This file puts `build:` back for anyone who needs to exercise the
+# working tree rather than the last published image.
+#
+# Both profile services are listed. compose.yml gives them a shared YAML anchor
+# (x-miragen-mcp-base), but anchors resolve within a single file — an override
+# file merges per service name, so each one has to be named here.
+#
+# `image:` is overridden too, and that is not cosmetic. Compose tags a build
+# with the service's `image:` value, and this file is most often used on the
+# host that also runs the stack, so inheriting the base file's name would have
+# a local `--build` overwrite the `ghcr.io/ieepirzy/miragen-mcp:latest` tag
+# that the next `docker compose up` resolves locally before it ever consults
+# the registry — a hand-built image silently becoming what production runs.
+
+services:
+
+  miragen-mcp:
+    build:
+      context: .
+    image: miragen-mcp:${COMPOSE_PROJECT_NAME:-local}
+
+  miragen-mcp-homelab:
+    build:
+      context: .
+    image: miragen-mcp:${COMPOSE_PROJECT_NAME:-local}

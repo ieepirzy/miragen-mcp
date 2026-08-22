@@ -44,15 +44,26 @@
 # by construction: only one service block is ever instantiated, so there is
 # no unconditional network declaration to get wrong.
 #
-# Deploy:
-#   docker compose --profile vps     up -d --build
-#   docker compose --profile homelab up -d --build
+# Deploy (pulls the published image; nothing is built on the host):
+#   docker compose --profile vps     up -d
+#   docker compose --profile homelab up -d
+#
+# To build from this checkout instead, layer the build override on top:
+#   docker compose -f compose.yml -f compose.ci.yml --profile vps up -d --build
 # (or set COMPOSE_PROFILES=vps / =homelab in the environment -- Compose reads
 # it natively, which is what makes this work from Portainer's env var UI.)
 
 x-miragen-mcp-base: &miragen-mcp-base
-  build:
-    context: .
+  # CI-built image, not a build from this checkout. The deployment host pulls
+  # what CI already built and tested; it compiles nothing. Tagged through
+  # MIRAGEN_MCP_IMAGE_TAG so an environment can be pinned from Portainer's env
+  # var UI without editing this file — unset for `latest` (what main
+  # publishes), or `sha-<commit>` to pin or roll back. That indirection matters
+  # more here than elsewhere: Portainer locks a git stack's Compose path at
+  # creation, so an env var is the only thing about this stack you can change
+  # after the fact. To build from a checkout instead, layer compose.ci.yml on
+  # top (see that file).
+  image: ghcr.io/ieepirzy/miragen-mcp:${MIRAGEN_MCP_IMAGE_TAG:-latest}
   container_name: miragen-mcp
   restart: unless-stopped
   environment:

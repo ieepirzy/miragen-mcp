@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable so publish.yml can gate the image on this suite rather than
+  # duplicating it — same arrangement as the miragen repo's test.yml.
+  workflow_call:
 
 jobs:
   test:

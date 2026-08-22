@@ -1,0 +1,69 @@
+name: Publish Docker image
+
+# compose.yml consumes this image rather than building on the deployment host.
+# This workflow is what produces it.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Not on pull_request, deliberately: a PR build would either publish
+# unreviewed code under the tag the stack follows, or produce an image nobody
+# pulls.
+
+concurrency:
+  # Two pushes to main in quick succession would otherwise race to tag
+  # `latest`, and the loser's digest is the one that sticks.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: test
+    # ubuntu-latest is correct here and would not be in the movingfirm repos:
+    # this repository is public, so GitHub's hosted minutes are free and
+    # unlimited. The private repos have to use self-hosted runners because the
+    # account's included minutes are exhausted and their hosted jobs are simply
+    # never assigned a runner.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The only write this workflow needs. `contents` stays read so a
+      # compromised build step cannot push to the repository.
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
