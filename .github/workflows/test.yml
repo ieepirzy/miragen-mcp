@@ -60,7 +60,25 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main
+    # Pinned to an immutable commit, not `@main`. Two reasons, and either
+    # alone would be sufficient.
+    #
+    # Security: `uses:` on a mutable ref executes whatever that branch holds at
+    # run time, in this repository's runner, with this repository's
+    # credentials -- so a change in another repository takes effect here with
+    # no reviewed change here. A SHA makes every collector upgrade a commit in
+    # this repo that someone approves.
+    #
+    # Measurement: the collector computes the function set, the percentiles and
+    # the aggregates. A moving ref means two runs can execute materially
+    # different code with nothing in the snapshot to explain a shift, which is
+    # the silent redefinition this lane exists to prevent. `measure.yml` pins
+    # the collector package for exactly this reason; leaving the workflow
+    # reference itself mutable left the same hole one level up.
+    #
+    # This is the same commit `@main` resolved to when this PR's runs were
+    # measured, so pinning changes no number here.
+    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81
     with:
       # The real dependencies, not the stubs conftest.py installs for the
       # suite: pyright resolves imports against the installed environment, so
@@ -72,4 +90,10 @@ jobs:
       # Telemetry only for now -- the E402 baseline in server.py may end up in
       # `lint_ignore` rather than being restructured away. See mira-vitals.toml.
       gate: false
-    secrets: inherit
+    # Named rather than `inherit`. `inherit` forwards every secret this
+    # repository holds across a repository boundary; measure.yml declares
+    # exactly these two, both optional, and needs nothing else. Telemetry
+    # credentials are the whole of what the collector should ever see.
+    secrets:
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+      CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
