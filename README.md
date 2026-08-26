@@ -242,9 +242,11 @@ auth enabled and no `MCP_CLIENT_SECRET` set (see [Authentication](#authenticatio
 | `MIRAGEND_TOKEN` | *(empty)* | Bearer token for the daemon API — must equal the daemon's own `MIRAGEND_TOKEN` |
 | `MIRAGEN_INTERNAL_TOKEN` | *(empty)* | Sent as `X-Miragen-Token` on calls to the agents' HTTP control APIs — set it to the same value the agent containers use, if they enforce one |
 | `MCP_BASE_URL` | *(required)* | Public base URL of this server — used for OAuth |
-| `MCP_CLIENT_ID` | `miragen-mcp` | OAuth client ID |
-| `MCP_CLIENT_SECRET` | `changeme` | OAuth client secret — **must be set explicitly if auth is enabled** |
-| `MCP_CLIENT_REDIRECT_URIS` | claude.ai/claude.com callbacks | OAuth redirect allowlist for the pre-registered client — origo rejects every redirect_uri at `/authorize` (fail closed) without one, so this must be set correctly for any client to authorize at all |
+| `MCP_CLIENT_ID` | `miragen-mcp` | Admin OAuth client ID — full access to every tool |
+| `MCP_CLIENT_SECRET` | `changeme` | Admin OAuth client secret — **must be set explicitly if auth is enabled** |
+| `MCP_READONLY_CLIENT_ID` | *(unset)* | Read-only OAuth client ID — see [Authentication](#authentication). Both this and the secret below must be set together, or the feature stays off |
+| `MCP_READONLY_CLIENT_SECRET` | *(unset)* | Read-only OAuth client secret |
+| `MCP_CLIENT_REDIRECT_URIS` | claude.ai/claude.com callbacks | OAuth redirect allowlist, shared by the admin client and the read-only client (if configured) — origo rejects every redirect_uri at `/authorize` (fail closed) without one, so this must be set correctly for any client to authorize at all |
 | `MCP_NO_AUTH` | `false` | Disable OAuth entirely (local development only) |
 | `MCP_ALLOW_DEFAULT_SECRET` | `false` | Explicitly acknowledge and allow starting with the default `changeme` secret while auth is enabled (not recommended) |
 
@@ -345,6 +347,24 @@ that is folded back into the agent's run as context.
 The server is protected with OAuth2 via the [Origo](https://github.com/ieepirzy/origo) library. Tokens are valid for 7 days. Configure your MCP client with the client credentials defined by `MCP_CLIENT_ID` and `MCP_CLIENT_SECRET`.
 
 If `MCP_NO_AUTH` is not `true`, the server refuses to start when `MCP_CLIENT_SECRET` is left unset (defaulting to the well-known value `changeme`) — this server holds the Docker socket, so booting with a publicly-known OAuth secret is a full compromise waiting to happen. Set a real `MCP_CLIENT_SECRET`, set `MCP_NO_AUTH=true` for auth-free local development, or set `MCP_ALLOW_DEFAULT_SECRET=true` to explicitly acknowledge the risk and start anyway (not recommended outside of throwaway testing).
+
+### Two clients: admin and read-only
+
+By default there is exactly one OAuth client (`MCP_CLIENT_ID` / `MCP_CLIENT_SECRET`), and every token it mints can call every tool — including `miragen_delete_agent`, `miragen_run_agent`, `miragen_resolve_approval`, and anything else that changes state.
+
+Setting **both** `MCP_READONLY_CLIENT_ID` and `MCP_READONLY_CLIENT_SECRET` registers a second, read-only client. Tokens minted for it may only call tools marked read-only in the [Tools](#tools) table above — the exact set is derived at server startup from each tool's `readOnlyHint` annotation, not hand-maintained, so it can't silently fall out of sync with the table. Anything else — writes, restarts, deletes, resolving an approval, running or scheduling a prompt — is refused with a normal tool result (not a connection error):
+
+```
+ERROR: this token is read-only; 'miragen_delete_agent' modifies state. Reconnect with the admin client to use it.
+```
+
+`tools/list` is filtered the same way, so a read-only client only ever sees the tools it's actually allowed to call.
+
+Leave both variables unset to keep the single-admin-client behavior — the feature adds no overhead and changes nothing about existing tokens, clients, or the OAuth flow when it's off.
+
+**A read-only token is not a "safe to hand to anyone" token.** `miragen_get_agent`, `miragen_read_agent_file`, `miragen_get_agent_logs`, and `miragen_get_run*` can all return secrets an agent's profile, workspace, or run history happens to contain — API keys pasted into a YAML field, credentials in a log line, tokens embedded in a data file or a run's captured output — since nothing in this server redacts agent-authored content. Treat the read-only client as "no destructive actions," not as "no sensitive data." A monitoring dashboard or low-trust LLM client is exactly the intended use case; a client you don't trust with your agents' configs and logs is not.
+
+**How scope is determined today.** Tokens don't yet carry a first-class `admin`/`read-only` scope claim from Origo — that requires per-client scope configuration on the Origo side, tracked separately. Until then, this server re-verifies each request's own already-authenticated bearer token against the `OAuthProvider` it holds, purely to read back which pre-registered `client_id` minted it (an origo-authoritative fact, not client-supplied input), and treats a match on `MCP_READONLY_CLIENT_ID` as read-only. This is a fully self-contained, safe interim: it cannot grant anything OAuth didn't already grant, since a request only reaches this check after Origo's own middleware has already validated the token.
 
 ## Development
 

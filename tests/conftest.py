@@ -94,3 +94,39 @@ _fake_mcp.http_app.return_value = _FakeApp()
 _fastmcp_mod = MagicMock()
 _fastmcp_mod.FastMCP.return_value = _fake_mcp
 sys.modules["fastmcp"] = _fastmcp_mod
+
+
+# fastmcp.server.middleware.Middleware is subclassed by server.py's
+# ReadOnlyGuardMiddleware, so it must be a real class (an instance of
+# MagicMock cannot be used as a base class) — same for ToolError, which must
+# be a real exception type. get_http_request is called and its RuntimeError
+# caught, so it must be a real callable too.
+
+
+class _StubMiddleware:
+    async def on_call_tool(self, context, call_next):
+        return await call_next(context)
+
+    async def on_list_tools(self, context, call_next):
+        return await call_next(context)
+
+
+class _StubToolError(Exception):
+    pass
+
+
+def _stub_get_http_request():
+    raise RuntimeError("no active HTTP request (test stub)")
+
+
+_fastmcp_middleware_mod = MagicMock()
+_fastmcp_middleware_mod.Middleware = _StubMiddleware
+sys.modules["fastmcp.server.middleware"] = _fastmcp_middleware_mod
+
+_fastmcp_exceptions_mod = MagicMock()
+_fastmcp_exceptions_mod.ToolError = _StubToolError
+sys.modules["fastmcp.exceptions"] = _fastmcp_exceptions_mod
+
+_fastmcp_dependencies_mod = MagicMock()
+_fastmcp_dependencies_mod.get_http_request = _stub_get_http_request
+sys.modules["fastmcp.server.dependencies"] = _fastmcp_dependencies_mod

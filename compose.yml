@@ -73,6 +73,11 @@ x-miragen-mcp-base: &miragen-mcp-base
     MCP_BASE_URL: ${MCP_BASE_URL}
     MCP_CLIENT_ID: ${MCP_CLIENT_ID}
     MCP_CLIENT_SECRET: ${MCP_CLIENT_SECRET}
+    # Optional second OAuth client restricted to read-only tools -- see the
+    # README's Authentication section. Both must be set together or the
+    # feature stays off.
+    MCP_READONLY_CLIENT_ID: ${MCP_READONLY_CLIENT_ID:-}
+    MCP_READONLY_CLIENT_SECRET: ${MCP_READONLY_CLIENT_SECRET:-}
     # Extra OAuth redirect URIs beyond the claude.ai/claude.com defaults,
     # comma-separated. Leave empty for claude.ai.
     MCP_CLIENT_REDIRECT_URIS: ${MCP_CLIENT_REDIRECT_URIS:-}

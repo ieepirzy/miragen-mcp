@@ -5,7 +5,12 @@ httpx.MockTransport installed on server._daemon_transport — the same seam
 pattern test_run_tools.py uses for agent traffic."""
 
 import asyncio
+import importlib
 import json
+import re
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -592,5 +597,289 @@ def test_empty_client_secret_fails_closed(monkeypatch):
     finally:
         # Restore the conftest env (MCP_ALLOW_DEFAULT_SECRET=true) and
         # re-execute the module so later tests see a fully-initialized state.
+        monkeypatch.undo()
+        importlib.reload(server)
+
+
+# ── read-only access control: _readonly_tool_names ───────────────────────────
+
+
+def test_readonly_tool_names_basic_extraction():
+    source = (
+        "@mcp.tool(name='a', annotations=_annotations('A', read_only=True))\n"
+        "def a(): pass\n\n"
+        "@mcp.tool(name='b', annotations=_annotations('B'))\n"
+        "def b(): pass\n\n"
+        "@mcp.tool(name='c', annotations=_annotations('C', read_only=True, destructive=True))\n"
+        "async def c(): pass\n"
+    )
+    assert server._readonly_tool_names(source) == {"a", "c"}
+
+
+def test_readonly_tool_names_ignores_other_decorators():
+    source = (
+        "@register\n"
+        "async def not_an_mcp_tool(ctx): pass\n\n"
+        "@mcp.tool(name='real', annotations=_annotations('Real', read_only=True))\n"
+        "def real(): pass\n"
+    )
+    assert server._readonly_tool_names(source) == {"real"}
+
+
+def test_readonly_tool_names_invalid_syntax():
+    assert server._readonly_tool_names("def (broken:") == set()
+
+
+def test_readonly_tool_names_empty_source():
+    assert server._readonly_tool_names("") == set()
+
+
+def _readme_readonly_tool_names() -> set[str]:
+    """Ground truth pulled from the README's tool table (Hints column) —
+    written by hand and independent of _readonly_tool_names' own AST parsing,
+    so this cross-check can actually catch the two drifting apart."""
+    readme = (Path(server.__file__).parent / "README.md").read_text()
+    names = set()
+    for line in readme.splitlines():
+        m = re.match(r"\| `(miragen_\w+)` \| ([^|]+) \|", line)
+        if m and "read-only" in m.group(2):
+            names.add(m.group(1))
+    return names
+
+
+def test_readonly_tool_names_matches_real_server_annotations():
+    """The permitted set for real read-only tokens, derived at runtime from
+    this file's own @mcp.tool(..., annotations=_annotations(..., read_only=True))
+    calls, equals the actual set of read-only-hinted tools — checked here
+    against the independently hand-written README table rather than by
+    re-deriving the same AST logic under test."""
+    source = Path(server.__file__).read_text()
+    derived = server._readonly_tool_names(source)
+    assert derived  # sanity: the real file does have read-only tools
+    assert derived == _readme_readonly_tool_names()
+
+
+def test_readonly_tool_names_matches_evals_ground_truth():
+    """evals/check_evals.py's tool_readonly_map() derives the same fact
+    (read-only tools) from the same source independently, for a different
+    consumer (the eval suite). The two must agree."""
+    evals_dir = Path(server.__file__).parent / "evals"
+    sys.path.insert(0, str(evals_dir))
+    try:
+        import check_evals
+    finally:
+        sys.path.remove(str(evals_dir))
+    source = Path(server.__file__).read_text()
+    readonly_map = check_evals.tool_readonly_map(source)
+    expected = {name for name, read_only in readonly_map.items() if read_only}
+    assert server._readonly_tool_names(source) == expected
+
+
+# ── read-only access control: _request_is_readonly ───────────────────────────
+
+
+class _FakeAuth:
+    resource_identifier = "https://mcp.example.com/mcp"
+
+    def __init__(self, tokens: dict):
+        self._tokens = tokens
+
+    def verify_token(self, token, resource=None):
+        return self._tokens.get(token)
+
+
+def _fake_request(auth_header: str | None):
+    headers = {"authorization": auth_header} if auth_header is not None else {}
+    return SimpleNamespace(headers=headers)
+
+
+def test_request_is_readonly_feature_off_always_false():
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    request = _fake_request("Bearer tok")
+    assert server._request_is_readonly(auth, None, request) is False
+    assert server._request_is_readonly(auth, "", request) is False
+
+
+def test_request_is_readonly_matches_readonly_client():
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    request = _fake_request("Bearer tok")
+    assert server._request_is_readonly(auth, "ro-client", request) is True
+
+
+def test_request_is_readonly_admin_client_is_false():
+    auth = _FakeAuth({"tok": {"client_id": "admin-client"}})
+    request = _fake_request("Bearer tok")
+    assert server._request_is_readonly(auth, "ro-client", request) is False
+
+
+def test_request_is_readonly_invalid_token_is_false():
+    auth = _FakeAuth({})
+    request = _fake_request("Bearer garbage")
+    assert server._request_is_readonly(auth, "ro-client", request) is False
+
+
+def test_request_is_readonly_missing_bearer_prefix_is_false():
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    request = _fake_request("tok")
+    assert server._request_is_readonly(auth, "ro-client", request) is False
+
+
+def test_request_is_readonly_no_auth_header_is_false():
+    auth = _FakeAuth({})
+    request = _fake_request(None)
+    assert server._request_is_readonly(auth, "ro-client", request) is False
+
+
+# ── read-only access control: ReadOnlyGuardMiddleware ────────────────────────
+
+
+class _FakeContext:
+    def __init__(self, name):
+        self.message = SimpleNamespace(name=name)
+
+
+async def _call_next_ok(context):
+    return "OK"
+
+
+def test_guard_allows_readonly_tool_for_readonly_token(monkeypatch):
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    guard = server.ReadOnlyGuardMiddleware(auth, "ro-client", {"safe_tool"})
+    monkeypatch.setattr(server, "get_http_request", lambda: _fake_request("Bearer tok"))
+
+    result = run(guard.on_call_tool(_FakeContext("safe_tool"), _call_next_ok))
+    assert result == "OK"
+
+
+def test_guard_blocks_mutating_tool_for_readonly_token(monkeypatch):
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    guard = server.ReadOnlyGuardMiddleware(auth, "ro-client", {"safe_tool"})
+    monkeypatch.setattr(server, "get_http_request", lambda: _fake_request("Bearer tok"))
+
+    with pytest.raises(server.ToolError) as exc_info:
+        run(guard.on_call_tool(_FakeContext("dangerous_tool"), _call_next_ok))
+    assert str(exc_info.value) == (
+        "ERROR: this token is read-only; 'dangerous_tool' modifies state. "
+        "Reconnect with the admin client to use it."
+    )
+
+
+def test_guard_allows_mutating_tool_for_admin_token(monkeypatch):
+    auth = _FakeAuth({"tok": {"client_id": "admin-client"}})
+    guard = server.ReadOnlyGuardMiddleware(auth, "ro-client", {"safe_tool"})
+    monkeypatch.setattr(server, "get_http_request", lambda: _fake_request("Bearer tok"))
+
+    result = run(guard.on_call_tool(_FakeContext("dangerous_tool"), _call_next_ok))
+    assert result == "OK"
+
+
+def test_guard_on_list_tools_filters_for_readonly_token(monkeypatch):
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    guard = server.ReadOnlyGuardMiddleware(auth, "ro-client", {"safe_tool"})
+    monkeypatch.setattr(server, "get_http_request", lambda: _fake_request("Bearer tok"))
+
+    all_tools = [SimpleNamespace(name="safe_tool"), SimpleNamespace(name="dangerous_tool")]
+
+    async def call_next(context):
+        return all_tools
+
+    result = run(guard.on_list_tools(_FakeContext(None), call_next))
+    assert [t.name for t in result] == ["safe_tool"]
+
+
+def test_guard_on_list_tools_unfiltered_for_admin_token(monkeypatch):
+    auth = _FakeAuth({"tok": {"client_id": "admin-client"}})
+    guard = server.ReadOnlyGuardMiddleware(auth, "ro-client", {"safe_tool"})
+    monkeypatch.setattr(server, "get_http_request", lambda: _fake_request("Bearer tok"))
+
+    all_tools = [SimpleNamespace(name="safe_tool"), SimpleNamespace(name="dangerous_tool")]
+
+    async def call_next(context):
+        return all_tools
+
+    result = run(guard.on_list_tools(_FakeContext(None), call_next))
+    assert [t.name for t in result] == ["safe_tool", "dangerous_tool"]
+
+
+def test_guard_no_http_request_context_fails_open(monkeypatch):
+    """get_http_request() raising RuntimeError (no live HTTP request) must
+    not itself deny a call — it means _is_readonly_request can't prove the
+    token is read-only, so the request is treated like any other unscoped
+    (admin) call."""
+    auth = _FakeAuth({"tok": {"client_id": "ro-client"}})
+    guard = server.ReadOnlyGuardMiddleware(auth, "ro-client", {"safe_tool"})
+
+    def _raise():
+        raise RuntimeError("no request")
+
+    monkeypatch.setattr(server, "get_http_request", _raise)
+    result = run(guard.on_call_tool(_FakeContext("dangerous_tool"), _call_next_ok))
+    assert result == "OK"
+
+
+# ── read-only access control: env-var wiring, inert by default ──────────────
+
+
+def test_readonly_feature_inert_when_env_unset(monkeypatch):
+    monkeypatch.delenv("MCP_READONLY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("MCP_READONLY_CLIENT_SECRET", raising=False)
+    server.mcp.add_middleware.reset_mock()
+    try:
+        importlib.reload(server)
+        assert server.READONLY_CLIENT_ID is None
+        assert server.READONLY_CLIENT_SECRET is None
+        guard_calls = [
+            c for c in server.mcp.add_middleware.call_args_list
+            if c.args and isinstance(c.args[0], server.ReadOnlyGuardMiddleware)
+        ]
+        assert guard_calls == []
+        origo_mock = sys.modules["origo"]
+        clients_passed = origo_mock.OAuthProvider.call_args.kwargs["clients"]
+        assert clients_passed == {server.CLIENT_ID: server.CLIENT_SECRET}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(server)
+
+
+def test_readonly_client_and_guard_added_when_env_set(monkeypatch):
+    monkeypatch.setenv("MCP_READONLY_CLIENT_ID", "ro-client")
+    monkeypatch.setenv("MCP_READONLY_CLIENT_SECRET", "ro-secret")
+    server.mcp.add_middleware.reset_mock()
+    try:
+        importlib.reload(server)
+        assert server.READONLY_CLIENT_ID == "ro-client"
+
+        origo_mock = sys.modules["origo"]
+        clients_passed = origo_mock.OAuthProvider.call_args.kwargs["clients"]
+        assert clients_passed == {server.CLIENT_ID: server.CLIENT_SECRET, "ro-client": "ro-secret"}
+
+        guard_calls = [
+            c.args[0] for c in server.mcp.add_middleware.call_args_list
+            if c.args and isinstance(c.args[0], server.ReadOnlyGuardMiddleware)
+        ]
+        assert len(guard_calls) == 1
+        assert guard_calls[0]._readonly_client_id == "ro-client"
+        assert guard_calls[0]._readonly_tool_names == server._readonly_tool_names(
+            Path(server.__file__).read_text()
+        )
+    finally:
+        monkeypatch.undo()
+        importlib.reload(server)
+
+
+def test_readonly_warns_when_only_one_var_set(monkeypatch):
+    monkeypatch.setenv("MCP_READONLY_CLIENT_ID", "ro-client")
+    monkeypatch.delenv("MCP_READONLY_CLIENT_SECRET", raising=False)
+    try:
+        with pytest.warns(UserWarning, match="must both be set"):
+            importlib.reload(server)
+        # Partial config must not half-enable the feature.
+        assert server.READONLY_CLIENT_ID == "ro-client"
+        guard_calls = [
+            c for c in server.mcp.add_middleware.call_args_list
+            if c.args and isinstance(c.args[0], server.ReadOnlyGuardMiddleware)
+        ]
+        assert guard_calls == []
+    finally:
         monkeypatch.undo()
         importlib.reload(server)
