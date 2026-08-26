@@ -78,7 +78,7 @@ jobs:
     #
     # This is the same commit `@main` resolved to when this PR's runs were
     # measured, so pinning changes no number here.
-    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81
+    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@97fe42fc57884a80689e856b84d68ea791013230
     with:
       # The real dependencies, not the stubs conftest.py installs for the
       # suite: pyright resolves imports against the installed environment, so
