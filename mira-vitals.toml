@@ -1,0 +1,63 @@
+# Code health and provenance telemetry (mira-vitals) for this repository.
+#
+# Standalone rather than `[tool.mira_vitals]` in a pyproject.toml: this is a
+# requirements.txt application, not a package, and introducing a pyproject.toml
+# purely to hold these settings would change how build and packaging tools see
+# the repository -- a bigger change than it looks.
+#
+# CI orchestrates, the repository configures, and neither holds the data
+# model: `.github/workflows/test.yml` calls the reusable workflow, and what
+# gets measured here is declared in this file, versioned and reviewable.
+
+# The shipped adapter is one module. `evals/` is this repository's own test
+# tooling and `tests/` is the suite -- both are linted, neither belongs in a
+# maintainability series about the thing the container actually runs.
+paths = ["server.py"]
+
+# Lint is measured wider, because an unused local in an eval helper is still
+# a real finding worth trending.
+lint_paths = ["server.py", "evals", "tests"]
+
+# Measured everywhere, gated nowhere yet. At adoption `server.py` has 5 ruff
+# findings, all E402 -- imports below a module-level docstring and the stub
+# shims the adapter installs before importing its dependencies, which is
+# deliberate and not obviously wrong -- and `evals/` has 1 F841. Gating on day
+# one would force a restructuring of the import block to satisfy a rule that
+# may well end up in `lint_ignore` instead. Measured and trended from the
+# first run; this flips to true once that is settled and the baseline is zero.
+lint_blocking = false
+
+# The ruff rule selection, declared explicitly rather than left to ruff's
+# defaults. Without it `lint.total` means "whatever this version of ruff
+# selects by default", which is not a stable metric: the same origo commit
+# measured 12 findings under ruff 0.15.8 and 153 under 0.16.4. E1/E2/E3/E5
+# (whitespace, line length) are excluded deliberately -- E501 would dominate
+# the number with a signal about line width rather than code health.
+lint_select = ["E4", "E7", "E9", "F", "W"]
+
+typecheck_paths = ["server.py"]
+type_checker = "pyright"
+# Measured from the first run, gated only once the baseline reaches zero.
+typecheck_blocking = false
+
+hotspot_limit = 20
+
+# Provenance is configuration, not code: the collector ships knowing about no
+# orchestrator and no label scheme. The schema lives here because it is a
+# property of this repository's conventions -- versioned, reviewable in a pull
+# request, identical across runs. The values arrive as environment variables
+# at run time, because only whatever launched the run knows them. Nothing is
+# ever inferred from commit messages, author names or branch prefixes.
+[provenance.labels]
+"authoring:human" = "human"
+"authoring:human-assisted" = "human_assisted"
+"authoring:agent-supervised" = "agent_supervised"
+"authoring:agent-autonomous" = "agent_autonomous"
+"authoring:mixed" = "mixed"
+
+# MiraRun is this ecosystem's agent orchestrator. It contributes nothing
+# unless `MIRARUN_RUN_ID` is set: a named agent with no run to point at is an
+# assertion, not a record.
+[[provenance.agent_sources]]
+name = "mirarun"
+env = { run_id = "MIRARUN_RUN_ID", name = "MIRARUN_AGENT_NAME", provider = "MIRARUN_AGENT_PROVIDER", model = "MIRARUN_MODEL", authoring_mode = "MIRARUN_AUTHORING_MODE", environment_id = "MIRARUN_ENVIRONMENT_ID" }

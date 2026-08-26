@@ -18,11 +18,82 @@ jobs:
           python-version: "3.12"
       # conftest.py stubs docker, fastmcp, origo, apscheduler and friends,
       # so only the light runtime deps are needed to run the suite.
-      - run: pip install pytest httpx pyyaml pydantic
+      - run: pip install pytest pytest-cov httpx pyyaml pydantic
       # python -m pytest (not bare pytest) so the repo root — where server.py
       # lives — is on sys.path for the test imports.
-      - run: python -m pytest tests/ -q
+      - run: |
+          python -m pytest tests/ -q \
+            --junitxml=reports/junit.xml \
+            --cov=server --cov-report=xml:reports/coverage.xml
+
+      - name: Publish the reports the code-health lane consumes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py312
+          path: reports/
+          retention-days: 7
       # Eval-suite consistency (mcp-builder Phase 4): assert every eval.xml
       # answer still derives from the fixtures and touches only read-only tools.
       # No ANTHROPIC_API_KEY — the paid LLM run (evals/run_evals.py) is manual.
       - run: python evals/check_evals.py
+
+  # Code health, maintainability and authorship telemetry. The collector is a
+  # separate package so the measurement definitions live in one place across
+  # every repository rather than being copied into each one; what *this*
+  # repository measures is declared in `mira-vitals.toml`.
+  #
+  # `needs: [test]` with `if: always()` on purpose: the snapshot should
+  # describe the run that gated the build, including a run whose tests failed
+  # -- a failing suite is a code-health observation, not a reason to record
+  # nothing.
+  code-health:
+    name: Code health
+    needs: [test]
+    if: always()
+    # A called reusable workflow's jobs cannot request permissions greater
+    # than the calling job's, and exceeding them fails the whole run before
+    # any job starts -- `startup_failure`, with no log to read. measure.yml
+    # needs `actions: read` to fetch the baseline artifact from the previous
+    # default-branch run and `pull-requests: read` for provenance labels.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    # Pinned to an immutable commit, not `@main`. Two reasons, and either
+    # alone would be sufficient.
+    #
+    # Security: `uses:` on a mutable ref executes whatever that branch holds at
+    # run time, in this repository's runner, with this repository's
+    # credentials -- so a change in another repository takes effect here with
+    # no reviewed change here. A SHA makes every collector upgrade a commit in
+    # this repo that someone approves.
+    #
+    # Measurement: the collector computes the function set, the percentiles and
+    # the aggregates. A moving ref means two runs can execute materially
+    # different code with nothing in the snapshot to explain a shift, which is
+    # the silent redefinition this lane exists to prevent. `measure.yml` pins
+    # the collector package for exactly this reason; leaving the workflow
+    # reference itself mutable left the same hole one level up.
+    #
+    # This is the same commit `@main` resolved to when this PR's runs were
+    # measured, so pinning changes no number here.
+    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81
+    with:
+      # The real dependencies, not the stubs conftest.py installs for the
+      # suite: pyright resolves imports against the installed environment, so
+      # without these its error count is dominated by reportMissingImports and
+      # is not comparable with a run that has them.
+      project-install: "-r requirements.txt"
+      reports-artifact: test-reports-py312
+      tests-python-version: "3.12"
+      # Telemetry only for now -- the E402 baseline in server.py may end up in
+      # `lint_ignore` rather than being restructured away. See mira-vitals.toml.
+      gate: false
+    # Named rather than `inherit`. `inherit` forwards every secret this
+    # repository holds across a repository boundary; measure.yml declares
+    # exactly these two, both optional, and needs nothing else. Telemetry
+    # credentials are the whole of what the collector should ever see.
+    secrets:
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+      CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
