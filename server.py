@@ -1,7 +1,10 @@
+import ast
 import inspect
 import logging
 import os
 import re
+import warnings
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
@@ -11,6 +14,9 @@ import uvicorn
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_request
+from fastmcp.server.middleware import Middleware
 from origo import OAuthMiddleware, OAuthProvider
 from pydantic import Field
 
@@ -37,6 +43,14 @@ CLIENT_ID = os.getenv("MCP_CLIENT_ID", "miragen-mcp")
 # "changeme" routes it into the fail-closed guard at the bottom of this file
 # instead of registering the client with an empty, trivially-known secret.
 CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET") or "changeme"
+# Second, optional OAuth client whose tokens are restricted to read-only tools
+# (see "Read-only access control" below). Same declared-but-empty normalizing
+# as CLIENT_SECRET above -- Compose exports an unset var as "", which must
+# read as "not configured", not as a literal empty client_id/secret. Feature
+# is off entirely unless both are set: a lone ID or SECRET is a
+# misconfiguration, not a partial activation (checked at startup below).
+READONLY_CLIENT_ID = os.getenv("MCP_READONLY_CLIENT_ID") or None
+READONLY_CLIENT_SECRET = os.getenv("MCP_READONLY_CLIENT_SECRET") or None
 AUTO_APPROVE = os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true"
 PUBLIC_REGISTRATION = os.getenv("MCP_PUBLIC_REGISTRATION", "false").lower() == "true"
 NO_AUTH = os.getenv("MCP_NO_AUTH", "false").lower() == "true"
@@ -1771,11 +1785,145 @@ Mode: {mode}
 
 
 # ---------------------------------------------------------------------------
+# Read-only access control
+# ---------------------------------------------------------------------------
+#
+# MCP_READONLY_CLIENT_ID / MCP_READONLY_CLIENT_SECRET register a second OAuth
+# client whose tokens may only call tools registered with readOnlyHint=True
+# (miragen_list_agents, miragen_get_agent_logs, ... -- never
+# miragen_delete_agent, miragen_run_agent, and the rest). Entirely inert
+# (zero behaviour change) unless both env vars are set.
+#
+# origo's OAuthMiddleware validates the bearer token and rejects the request
+# before FastMCP ever sees it, but it does not thread the token's client_id
+# onto the ASGI scope for downstream code to read -- verified against the
+# installed origo's own source (middleware.py discards verify_token()'s
+# return value once it's truthy, same as the versions before it). origo does
+# track a "scope" claim in token storage, but it is populated from whatever
+# the client requested at /authorize rather than from server-side per-client
+# config, so it isn't trustworthy as an admin/read-only signal yet (a gap on
+# origo's side, tracked separately). client_id is the one signal available
+# today that is NOT client-controlled: it comes from which pre-registered
+# client authenticated, matched against the `clients` dict built below. So:
+# re-verify the already-authenticated request's own bearer token through the
+# same OAuthProvider that just accepted it, purely to read back which
+# client_id minted it. This calls origo's own public verify_token() API a
+# second time -- it re-derives an existing, authoritative fact rather than
+# trusting any new input, and cannot itself grant access OAuthMiddleware
+# didn't already grant.
+
+
+def _readonly_tool_names(source: str) -> set[str]:
+    """Names of every @mcp.tool(...) in this file registered with
+    annotations=_annotations(..., read_only=True), found by parsing this
+    module's own source (mirrors evals/check_evals.py's tool_readonly_map,
+    which solves the same "derive read-only tools from server.py without
+    importing it" problem for the eval suite).
+
+    This is the permitted set for read-only tokens, and it is the single
+    source of truth for it -- there is no separate hand-maintained tool-name
+    list to drift out of sync with the real registrations. Static parsing
+    (rather than asking a live FastMCP instance for its registered tools)
+    keeps this correct under the test suite's fastmcp stub too, since it
+    never touches the `mcp` object.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for dec in node.decorator_list:
+            if not (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr == "tool"
+            ):
+                continue
+            tool_name = None
+            read_only = False
+            for kw in dec.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                    tool_name = kw.value.value
+                elif kw.arg == "annotations" and isinstance(kw.value, ast.Call):
+                    for akw in kw.value.keywords:
+                        if akw.arg == "read_only" and isinstance(akw.value, ast.Constant):
+                            read_only = bool(akw.value.value)
+            if tool_name and read_only:
+                names.add(tool_name)
+    return names
+
+
+def _request_is_readonly(auth: OAuthProvider, readonly_client_id: str | None, request) -> bool:
+    """True if `request` carries a bearer token minted for the read-only client.
+
+    Always False when `readonly_client_id` is falsy (feature off). Otherwise
+    re-verifies the token via the same OAuthProvider that already
+    authenticated this request -- see the module comment above for why a
+    second verify_token() call is how client_id gets read back today.
+    """
+    if not readonly_client_id:
+        return False
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False
+    token = auth_header[len("Bearer "):]
+    meta = auth.verify_token(token, resource=auth.resource_identifier)
+    return bool(meta) and meta.get("client_id") == readonly_client_id
+
+
+class ReadOnlyGuardMiddleware(Middleware):
+    """Restricts read-only-scoped tokens to tools with readOnlyHint=True.
+
+    The single chokepoint for read-only enforcement -- no per-tool code. The
+    permitted set (`readonly_tool_names`) is computed once at startup by
+    `_readonly_tool_names()` from the real annotations in this file.
+    """
+
+    def __init__(self, auth: OAuthProvider, readonly_client_id: str, readonly_tool_names: set[str]):
+        self._auth = auth
+        self._readonly_client_id = readonly_client_id
+        self._readonly_tool_names = readonly_tool_names
+
+    def _is_readonly_request(self) -> bool:
+        try:
+            request = get_http_request()
+        except RuntimeError:
+            return False
+        return _request_is_readonly(self._auth, self._readonly_client_id, request)
+
+    async def on_call_tool(self, context, call_next):
+        name = context.message.name
+        if name not in self._readonly_tool_names and self._is_readonly_request():
+            raise ToolError(
+                f"ERROR: this token is read-only; '{name}' modifies state. "
+                "Reconnect with the admin client to use it."
+            )
+        return await call_next(context)
+
+    async def on_list_tools(self, context, call_next):
+        tools = await call_next(context)
+        if self._is_readonly_request():
+            return [t for t in tools if t.name in self._readonly_tool_names]
+        return tools
+
+
+# ---------------------------------------------------------------------------
 # App assembly
 # ---------------------------------------------------------------------------
 
 
 app = mcp.http_app(stateless_http=True, path=MCP_PATH)
+
+if bool(READONLY_CLIENT_ID) != bool(READONLY_CLIENT_SECRET):
+    warnings.warn(
+        "MCP_READONLY_CLIENT_ID and MCP_READONLY_CLIENT_SECRET must both be set to enable "
+        "the read-only client -- only one was provided, so the read-only feature stays off.",
+        UserWarning,
+        stacklevel=1,
+    )
 
 if not NO_AUTH:
     if CLIENT_SECRET == "changeme":
@@ -1795,9 +1943,13 @@ if not NO_AUTH:
             "possible."
         )
 
+    clients = {CLIENT_ID: CLIENT_SECRET}
+    if READONLY_CLIENT_ID and READONLY_CLIENT_SECRET:
+        clients[READONLY_CLIENT_ID] = READONLY_CLIENT_SECRET
+
     provider_kwargs = dict(
         base_url=BASE_URL,
-        clients={CLIENT_ID: CLIENT_SECRET},
+        clients=clients,
         token_ttl=604800,
         auto_approve=AUTO_APPROVE,
         public_registration=PUBLIC_REGISTRATION,
@@ -1808,9 +1960,15 @@ if not NO_AUTH:
     # seeded with an explicit allowlist — there is no permissive default here,
     # unlike older origo releases. Pass one when this origo supports the
     # parameter, same fix already applied to miradeploy/mirarun's server.py
-    # for the same origo 0.1.10->0.1.11 behavior change.
+    # for the same origo 0.1.10->0.1.11 behavior change. The read-only client
+    # shares the same allowlist as the admin client -- an operator adding a
+    # dashboard/low-trust-client redirect URI sets MCP_CLIENT_REDIRECT_URIS
+    # once, for whichever client ends up using it.
     if "client_redirect_uris" in inspect.signature(OAuthProvider.__init__).parameters:
-        provider_kwargs["client_redirect_uris"] = {CLIENT_ID: _client_redirect_uris()}
+        redirect_uris = {CLIENT_ID: _client_redirect_uris()}
+        if READONLY_CLIENT_ID and READONLY_CLIENT_SECRET:
+            redirect_uris[READONLY_CLIENT_ID] = _client_redirect_uris()
+        provider_kwargs["client_redirect_uris"] = redirect_uris
     auth = OAuthProvider(**provider_kwargs)
 
     # Take origo's routes and state from the provider's own app rather than
@@ -1825,6 +1983,13 @@ if not NO_AUTH:
         app.router.routes.insert(0, route)
 
     app.add_middleware(OAuthMiddleware, provider=auth)
+
+    if READONLY_CLIENT_ID and READONLY_CLIENT_SECRET:
+        mcp.add_middleware(
+            ReadOnlyGuardMiddleware(
+                auth, READONLY_CLIENT_ID, _readonly_tool_names(Path(__file__).read_text())
+            )
+        )
 
     for _key, _value in vars(oauth_app.state)["_state"].items():
         setattr(app.state, _key, _value)
